@@ -24,9 +24,19 @@ vad:
   offset: 0.2
 
 # Voice commands - map phrases to actions
-# Built-in commands (always available):
-#   "press <key>" - send any key/combo (e.g., "press enter", "press control c")
-#   "type <text>" - type text literally (escape hatch for command phrases)
+#
+# Built-in (always available):
+#   "say <text>" - type literally: "say enter" types "enter"
+#   "<modifier> <key>" - key combo: "control c", "alt f4", "shift enter"
+#   "<action key>" - send key: "enter", "backspace", "tab", "escape"
+#   "<punctuation>" - type symbol: "semicolon" -> ;, "colon" -> :
+#
+# Punctuation names: hyphen, underscore, semicolon, colon, comma, period,
+#   forward slash, backslash, apostrophe, double quote, backtick, tilde,
+#   at sign, hash sign, dollar sign, percent sign, ampersand, asterisk,
+#   left/right paren, left/right bracket, left/right brace,
+#   less than, greater than, question mark, exclamation point
+#
 commands:
   # Keyboard shortcuts
   keys:

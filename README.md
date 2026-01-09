@@ -73,16 +73,34 @@ commands:
 
 ## Voice Commands
 
-Built-in commands (always available):
-- `"press <key>"` - send any key: "press enter", "press control c", "press alt f4"
-- `"type <text>"` - type literally (escape hatch): "type press enter" types "press enter"
+**Modifier combos** - say modifier + key:
+- `"control c"` → Ctrl+C
+- `"alt f4"` → Alt+F4
+- `"control shift t"` → Ctrl+Shift+T
 
-Default configured commands:
+**Action keys** - say the key name:
+- `"enter"`, `"tab"`, `"escape"`, `"backspace"`, `"delete"`
+- `"home"`, `"end"`, `"page up"`, `"page down"`
+- `"up"`, `"down"`, `"left"`, `"right"`
+- `"f1"` through `"f12"`
+
+**Punctuation** - say the name to type the symbol:
+- `"semicolon"` → `;`, `"colon"` → `:`
+- `"hyphen"` → `-`, `"underscore"` → `_`
+- `"apostrophe"` → `'`, `"double quote"` → `"`
+- `"at sign"` → `@`, `"hash sign"` → `#`
+- `"left paren"` → `(`, `"right paren"` → `)`
+- See config.yaml.example for full list
+
+**Escape hatch** - type literally:
+- `"say enter"` → types "enter" (the word)
+- `"say control c"` → types "control c"
+
+**Configured shortcuts**:
 - `"scratch that"` / `"undo"` → Ctrl+Z
-- `"redo"` → Ctrl+Shift+Z
 - `"new line"` → Enter
 - `"new paragraph"` → Enter Enter
-- `"select all"` / `"copy"` / `"paste"` / `"cut"` / `"save"`
+- Add your own in config.yaml
 
 ## VAD Calibration
 

@@ -73,6 +73,54 @@ KEY_CODES = {
     "comma": 51, "period": 52, "dot": 52, "slash": 53,
 }
 
+# Modifier keys that indicate a key combo
+MODIFIER_KEYS = {"ctrl", "control", "alt", "shift", "super", "meta", "windows", "win"}
+
+# Punctuation/symbol names to characters (for typing, not key codes)
+# Use distinct phrases to avoid accidental triggers during normal speech
+PUNCTUATION_CHARS = {
+    "hyphen": "-",
+    "underscore": "_",
+    "plus sign": "+",
+    "equals sign": "=",
+    "semicolon": ";",
+    "colon": ":",
+    "comma": ",",
+    "period": ".",
+    "forward slash": "/",
+    "backslash": "\\",
+    "pipe": "|",
+    "apostrophe": "'", "single quote": "'",
+    "double quote": '"', "quotation mark": '"',
+    "backtick": "`",
+    "tilde": "~",
+    "at sign": "@",
+    "hash sign": "#", "hashtag": "#",
+    "dollar sign": "$",
+    "percent sign": "%",
+    "caret": "^",
+    "ampersand": "&",
+    "asterisk": "*",
+    "left paren": "(", "open paren": "(",
+    "right paren": ")", "close paren": ")",
+    "left bracket": "[", "open bracket": "[",
+    "right bracket": "]", "close bracket": "]",
+    "left brace": "{", "open brace": "{",
+    "right brace": "}", "close brace": "}",
+    "less than": "<",
+    "greater than": ">",
+    "question mark": "?",
+    "exclamation point": "!",
+}
+
+# Action keys (these send key codes, not characters)
+ACTION_KEYS = {
+    "enter", "return", "tab", "escape", "esc", "backspace", "back",
+    "delete", "del", "home", "end", "page up", "pageup", "page down", "pagedown",
+    "up", "down", "left", "right", "insert", "ins",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+}
+
 # Default voice commands
 DEFAULT_COMMANDS = {
     "keys": {
@@ -106,7 +154,7 @@ DEFAULT_COMMANDS = {
 @dataclass
 class CommandResult:
     """Result of processing a voice command."""
-    action: str  # "keys", "literal", "type_escape", "none"
+    action: str  # "keys", "literal", "none"
     payload: str  # key sequence, literal text, or original text
 
 
@@ -208,35 +256,47 @@ class CommandProcessor:
         """
         Process text to detect voice commands.
 
-        Args:
-            text: Transcribed text (start of segment)
-
-        Returns:
-            CommandResult with action type and payload
+        Command priority:
+        1. "say X" -> type X literally (escape hatch)
+        2. Configured key commands (e.g., "scratch that" -> ctrl+z)
+        3. Configured literals
+        4. Modifier combos (e.g., "control c" -> ctrl+c)
+        5. Action keys (e.g., "enter", "backspace")
+        6. Punctuation names (e.g., "semicolon" -> ;)
+        7. Normal dictation
         """
-        text_lower = text.lower().strip()
+        text_lower = text.lower().strip().rstrip('.,!?')
+        text_clean = text.strip().rstrip('.,!?')
 
-        # 1. Check for "type X" escape (literal typing)
-        if text_lower.startswith("type "):
-            literal = text[5:]  # Preserve original case
-            return CommandResult("type_escape", literal)
+        # 1. "say X" escape - type literally
+        if text_lower.startswith("say "):
+            literal = text_clean[4:]  # Preserve original case
+            return CommandResult("literal", literal)
 
-        # 2. Check for "press X" key command
-        if text_lower.startswith("press "):
-            keys = text_lower[6:].strip()
-            return CommandResult("keys", self._normalize_keys(keys))
-
-        # 3. Check for configured key commands
+        # 2. Configured key commands (e.g., "scratch that")
         for cmd, keys in self.commands["keys"].items():
-            if text_lower == cmd or text_lower.startswith(cmd + " "):
+            if text_lower == cmd:
                 return CommandResult("keys", keys)
 
-        # 4. Check for configured literal commands
+        # 3. Configured literals
         for cmd, literal in self.commands["literals"].items():
-            if text_lower == cmd or text_lower.startswith(cmd + " "):
+            if text_lower == cmd:
                 return CommandResult("literal", literal)
 
-        # 5. Not a command - normal dictation
+        # 4. Check for modifier combo (e.g., "control c", "alt f4")
+        words = text_lower.split()
+        if words and words[0] in MODIFIER_KEYS:
+            return CommandResult("keys", self._normalize_keys(text_lower))
+
+        # 5. Action keys (enter, backspace, tab, etc.)
+        if text_lower in ACTION_KEYS:
+            return CommandResult("keys", self._normalize_keys(text_lower))
+
+        # 6. Punctuation names (semicolon -> ;)
+        if text_lower in PUNCTUATION_CHARS:
+            return CommandResult("literal", PUNCTUATION_CHARS[text_lower])
+
+        # 7. Normal dictation
         return CommandResult("none", text)
 
     def _normalize_keys(self, keys: str) -> str:
@@ -756,21 +816,15 @@ class WhisperTyperClient:
                 logger.debug(f"Skipping already-executed command: {text!r}")
                 return
 
-            # Check if text is a command (for immediate execution of some commands)
+            # Check if text is a command
             cmd_result = self.commands.process(text)
-            if cmd_result.action == "keys" or cmd_result.action == "type_escape":
-                # Execute key commands and type escapes immediately
+            if cmd_result.action in ("keys", "literal"):
+                # Execute commands immediately
                 # Clear any existing pending text first
                 if self.typer.state.pending_text:
                     self.typer.clear_pending()
                 self._execute_command(cmd_result)
                 # Track that we executed this command to prevent re-execution
-                self.typer.state.last_command_text = text
-            elif cmd_result.action == "literal":
-                # Literals also execute immediately
-                if self.typer.state.pending_text:
-                    self.typer.clear_pending()
-                self._execute_command(cmd_result)
                 self.typer.state.last_command_text = text
             else:
                 # Normal dictation - update pending
@@ -782,8 +836,6 @@ class WhisperTyperClient:
 
         if cmd_result.action == "keys":
             self.typer.send_keys(cmd_result.payload)
-        elif cmd_result.action == "type_escape":
-            self.typer.type_text(cmd_result.payload)
         elif cmd_result.action == "literal":
             self.typer.type_text(cmd_result.payload)
 
