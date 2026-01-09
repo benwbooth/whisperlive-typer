@@ -1,47 +1,124 @@
-# WhisperLive with ydotool for NixOS
+# WhisperLive Typer
 
-Real-time speech-to-text that types directly using keyboard simulation.
-Uses [WhisperLive](https://github.com/collabora/WhisperLive) with
-[CTranslate2-ROCm](https://github.com/arlo-phoenix/CTranslate2-rocm) for
-AMD GPU acceleration.
+Real-time speech-to-text that types directly into any application using keyboard simulation.
+Uses [WhisperLive](https://github.com/collabora/WhisperLive) server with AMD ROCm GPU acceleration.
+
+## Features
+
+- **Real-time typing**: Speaks → types at cursor position in any app
+- **Auto-correction**: Backspaces and fixes text as transcription updates
+- **Voice commands**: "press enter", "scratch that", "new line", etc.
+- **Configurable**: YAML config for commands, VAD thresholds, server settings
+- **VAD calibration**: Tool to optimize voice detection for your environment
+- **KDE hotkey**: Super+H to toggle on/off
 
 ## Architecture
 
 ```
-Microphone → Client (NixOS) → WebSocket → Server (Docker/ROCm) → GPU
-                ↓
-           ydotool → Keyboard Input → Any Application
+Microphone → Client (whisper_typer.py) → WebSocket → Server (Docker/ROCm) → GPU
+                      ↓
+                 ydotool → Keyboard Input → Any Application
 ```
-
-**Key feature**: When the transcription updates (e.g., correcting a word),
-the client automatically sends backspace keypresses to fix the text.
 
 ## Prerequisites
 
 - Docker or Podman with compose
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
-- AMD GPU (RX 7000 series tested)
+- AMD GPU with ROCm support (RX 6000/7000 series)
+- [Nix](https://nixos.org/) with flakes enabled
 - ydotool daemon running
-- portaudio (for microphone access)
 
 ## Quick Start
 
 ```bash
-# Run the setup script (builds Docker, configures hotkey)
+# Enter development shell
+nix develop
+
+# Run setup (builds Docker image, configures KDE hotkey)
 ./scripts/setup.sh
 
-# Edit config to set your microphone
-nano ~/.config/whisper-typer/config
+# Calibrate VAD for your microphone/environment
+./scripts/vad_calibrate.py --auto
 
 # Press Super+H to toggle speech-to-text!
 ```
 
-## Detailed Setup
+## Configuration
 
-### 1. Determine your GPU architecture
+Config file: `~/.config/whisper-typer/config.yaml`
+
+```yaml
+server:
+  host: localhost
+  port: 9090
+
+whisper:
+  language: en
+  model: small
+
+audio:
+  device: ""  # or "C930e" or device index
+
+vad:
+  onset: 0.3   # speech detection threshold
+  offset: 0.2  # speech end threshold
+
+commands:
+  keys:
+    "scratch that": "ctrl+z"
+    "new line": "enter"
+    # add your own...
+  literals:
+    # "smiley face": ":)"
+```
+
+## Voice Commands
+
+Built-in commands (always available):
+- `"press <key>"` - send any key: "press enter", "press control c", "press alt f4"
+- `"type <text>"` - type literally (escape hatch): "type press enter" types "press enter"
+
+Default configured commands:
+- `"scratch that"` / `"undo"` → Ctrl+Z
+- `"redo"` → Ctrl+Shift+Z
+- `"new line"` → Enter
+- `"new paragraph"` → Enter Enter
+- `"select all"` / `"copy"` / `"paste"` / `"cut"` / `"save"`
+
+## VAD Calibration
+
+The VAD (Voice Activity Detection) determines when you're speaking vs silence.
+Calibrate it for your environment:
 
 ```bash
-# Check your GPU
+./scripts/vad_calibrate.py --auto
+```
+
+This measures your silence/speech levels and saves optimal thresholds to config.
+
+## CLI Usage
+
+```bash
+./whisper_typer.py [OPTIONS]
+
+Options:
+  -c, --config PATH     Config file (default: ~/.config/whisper-typer/config.yaml)
+  -H, --host HOST       Server host
+  -p, --port PORT       Server port
+  -l, --language LANG   Language code
+  -m, --model MODEL     Whisper model size
+  -d, --device DEVICE   Microphone (index or name substring)
+  -L, --list-devices    List available microphones
+  --vad-onset FLOAT     VAD onset threshold (0.0-1.0)
+  --vad-offset FLOAT    VAD offset threshold (0.0-1.0)
+  -n, --dry-run         Don't type, just log
+  -v, --verbose         Debug logging
+```
+
+## GPU Setup
+
+### 1. Check your GPU architecture
+
+```bash
 rocminfo | grep "gfx"
 ```
 
@@ -55,141 +132,72 @@ rocminfo | grep "gfx"
 
 ### 2. Configure docker-compose.yml
 
-Edit `docker-compose.yml` and set your GPU architecture:
-
 ```yaml
 args:
   PYTORCH_ROCM_ARCH: gfx1100  # Change to match your GPU
   HSA_OVERRIDE_GFX_VERSION: "11.0.0"
 ```
 
-### 3. Build and start the server
+### 3. Build and start server
 
 ```bash
-# Enter the development shell
-nix develop
-
-# Build and start the server (first build takes a while - ~30 min)
-docker-compose up -d --build
-
-# Check logs
-docker-compose logs -f
+docker compose up -d --build  # First build takes ~30 min
+docker compose logs -f
 ```
 
-### 4. Start ydotool daemon
+## ydotool Setup
+
+ydotool is required for keyboard simulation (works on Wayland):
 
 ```bash
-# The daemon needs to run as your user
-# Add to your NixOS configuration:
+# NixOS: add to configuration.nix
 programs.ydotool.enable = true;
 
-# Or run manually:
-ydotoold &
+# Or run daemon manually
+sudo ydotoold &
+
+# Socket should be at /run/ydotoold/socket
 ```
-
-### 5. Run the client
-
-```bash
-# Using the flake
-nix run . -- --host localhost --port 9090
-
-# Or in dev shell
-python whisper_typer.py --host localhost --port 9090
-
-# Dry run (logs what would be typed)
-python whisper_typer.py --dry-run --verbose
-```
-
-## Hotkey Usage
-
-**Super+H** toggles speech-to-text:
-
-1. Press `Super+H` → notification "Listening..." appears
-2. Speak → words are typed at cursor position
-3. Press `Super+H` again → notification "Stopped" appears
-
-The toggle script is at `./scripts/toggle.sh`. Config file: `~/.config/whisper-typer/config`
-
-## CLI Usage
-
-```
-./whisper_typer.py [OPTIONS]
-
-Options:
-  -H, --host HOST       Server host (default: localhost)
-  -p, --port PORT       Server port (default: 9090)
-  -l, --language LANG   Language code (default: en)
-  -m, --model MODEL     Whisper model size (default: small)
-  -d, --device DEVICE   Microphone (index or name, e.g., "C930e")
-  -L, --list-devices    List available microphones
-  -s, --socket PATH     ydotool socket path
-  -n, --dry-run         Don't type, just log
-  -v, --verbose         Enable debug logging
-```
-
-The script uses `uv` to automatically manage Python dependencies.
-
-## Server Configuration
-
-Environment variables for the Docker container:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WHISPER_MODEL` | small | Model size: tiny, base, small, medium, large |
-| `WHISPER_LANGUAGE` | en | Language code |
-| `WHISPER_PORT` | 9090 | WebSocket port |
-| `WHISPER_MAX_CLIENTS` | 4 | Maximum concurrent clients |
-| `WHISPER_MAX_CONNECTION_TIME` | 600 | Max session duration (seconds) |
 
 ## Troubleshooting
 
 ### GPU not detected
 
 ```bash
-# Check ROCm can see your GPU
-docker-compose exec whisper-server rocminfo
-
-# Check PyTorch CUDA (ROCm) availability
-docker-compose exec whisper-server python -c "import torch; print(torch.cuda.is_available())"
+docker compose exec whisper-server rocminfo
+docker compose exec whisper-server python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 ### ydotool not typing
 
 ```bash
-# Check the daemon is running
+# Check daemon is running
 pgrep ydotoold
 
 # Check socket exists
-ls -la /run/user/$(id -u)/.ydotool_socket
+ls -la /run/ydotoold/socket
 
-# Test ydotool directly
-ydotool type "hello world"
+# Test directly
+ydotool type "hello"
 ```
 
-### Build fails
+### VAD too sensitive / not sensitive enough
 
-The CTranslate2-ROCm build requires ~100GB disk space and 30+ minutes.
-Ensure you have enough resources.
+Run the calibrator: `./scripts/vad_calibrate.py --auto`
 
-## How It Works
+Or manually adjust `vad.onset` in config:
+- Lower (0.1-0.2) = more sensitive, may trigger on noise
+- Higher (0.4-0.5) = less sensitive, may miss quiet speech
 
-1. **Server**: WhisperLive runs in a Docker container with ROCm-enabled
-   CTranslate2 for fast GPU inference using faster-whisper.
+### Whisper hallucinations
 
-2. **Client**: Captures microphone audio, streams it via WebSocket to the
-   server, receives transcription segments.
-
-3. **Typing**: The client tracks what has been typed. When a segment updates
-   (common in streaming transcription), it calculates the diff and uses
-   backspace to correct, then types the new text.
-
-4. **Finalization**: When a segment is marked "completed" (speech pause
-   detected), a space is added and the client moves to the next segment.
+If Whisper types random phrases ("Bye", "Thank you") during silence:
+- Increase `vad.onset` threshold
+- Use a directional microphone
+- Reduce background noise
 
 ## References
 
 - [WhisperLive](https://github.com/collabora/WhisperLive)
 - [CTranslate2-ROCm](https://github.com/arlo-phoenix/CTranslate2-rocm)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-- [wyoming-faster-whisper-rocm](https://github.com/Donkey545/wyoming-faster-whisper-rocm)
-- [AMD ROCm Whisper Blog](https://rocm.blogs.amd.com/artificial-intelligence/whisper/README.html)
