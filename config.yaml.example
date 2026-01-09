@@ -1,0 +1,61 @@
+# WhisperLive Typer Configuration
+# Location: ~/.config/whisper-typer/config.yaml
+
+server:
+  host: localhost
+  port: 9090
+
+whisper:
+  language: en
+  model: small  # tiny, base, small, medium, large
+
+audio:
+  # Microphone device - index number or name substring (e.g., "C930e" or "4")
+  # Run: ./whisper_typer.py --list-devices
+  # Leave empty for system default
+  device: ""
+
+vad:
+  # Voice Activity Detection thresholds (0.0 - 1.0)
+  # Calibrate with: scripts/vad_calibrate.py --auto
+  # Lower = more sensitive (may trigger on noise)
+  # Higher = less sensitive (may miss quiet speech)
+  onset: 0.3
+  offset: 0.2
+
+# Voice commands - map phrases to actions
+# Built-in commands (always available):
+#   "press <key>" - send any key/combo (e.g., "press enter", "press control c")
+#   "type <text>" - type text literally (escape hatch for command phrases)
+commands:
+  # Keyboard shortcuts
+  keys:
+    "scratch that": "ctrl+z"
+    "undo": "ctrl+z"
+    "undo that": "ctrl+z"
+    "redo": "ctrl+shift+z"
+    "redo that": "ctrl+shift+z"
+    "new line": "enter"
+    "newline": "enter"
+    "new paragraph": "enter enter"
+    "go back": "backspace"
+    "delete word": "ctrl+backspace"
+    "delete line": "ctrl+shift+k"
+    "select all": "ctrl+a"
+    "copy": "ctrl+c"
+    "copy that": "ctrl+c"
+    "paste": "ctrl+v"
+    "paste that": "ctrl+v"
+    "cut": "ctrl+x"
+    "cut that": "ctrl+x"
+    "save": "ctrl+s"
+    "save that": "ctrl+s"
+    # Add your own:
+    # "close tab": "ctrl+w"
+    # "new tab": "ctrl+t"
+
+  # Literal text strings
+  literals:
+    # "smiley face": ":)"
+    # "shrug": "¯\\_(ツ)_/¯"
+    # "my email": "you@example.com"

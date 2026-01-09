@@ -1,0 +1,46 @@
+services:
+  whisper-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # GPU Architecture - uncomment the one matching your GPU:
+        # RX 7900 XTX/XT = gfx1100
+        # RX 7800 XT/7700 XT = gfx1101
+        # RX 7600 = gfx1102
+        PYTORCH_ROCM_ARCH: gfx1100
+        HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+    container_name: whisperlive-rocm
+    restart: unless-stopped
+
+    # GPU device access for ROCm
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+
+    # Required for ROCm
+    security_opt:
+      - seccomp:unconfined
+    group_add:
+      - video
+      - render
+
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      - WHISPER_MODEL=small
+      - WHISPER_LANGUAGE=en
+      - WHISPER_PORT=9090
+      - WHISPER_MAX_CLIENTS=4
+      - WHISPER_MAX_CONNECTION_TIME=600
+
+    ports:
+      - "9090:9090"
+
+    volumes:
+      # Cache for downloaded models
+      - whisper-cache:/root/.cache/huggingface
+      - whisper-live-cache:/root/.cache/whisper-live
+
+volumes:
+  whisper-cache:
+  whisper-live-cache:

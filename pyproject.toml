@@ -1,0 +1,15 @@
+[project]
+name = "whisper-typer"
+version = "0.1.0"
+description = "Speech-to-text typing using WhisperLive and ydotool"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "sounddevice",
+    "websockets",
+    "pyyaml",
+    "pyaudio",
+    "torch",
+    "torchaudio",
+    "packaging",
+]
