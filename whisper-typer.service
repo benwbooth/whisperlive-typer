@@ -1,0 +1,14 @@
+[Unit]
+Description=WhisperLive Speech-to-Text Typer
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ben/src/whisperlive-typer
+ExecStart=/run/current-system/sw/bin/nix develop --command ./whisper_typer.py
+KillMode=control-group
+TimeoutStopSec=5
+Restart=no
+
+[Install]
+WantedBy=default.target

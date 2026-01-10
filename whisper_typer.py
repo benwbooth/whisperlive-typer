@@ -9,10 +9,12 @@ corrections when the transcription is updated.
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -111,6 +113,15 @@ PUNCTUATION_CHARS = {
     "greater than": ">",
     "question mark": "?",
     "exclamation point": "!",
+}
+
+# Single letters (typed immediately when spoken alone)
+SINGLE_LETTERS = {c: c for c in "abcdefghijklmnopqrstuvwxyz"}
+
+# Digit words -> numbers
+DIGIT_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
 }
 
 # Action keys (these send key codes, not characters)
@@ -263,7 +274,10 @@ class CommandProcessor:
         4. Modifier combos (e.g., "control c" -> ctrl+c)
         5. Action keys (e.g., "enter", "backspace")
         6. Punctuation names (e.g., "semicolon" -> ;)
-        7. Normal dictation
+        7. Spelled-out letters/digits (e.g., "A-B-C" or "A B C" -> abc)
+        8. Single letters (e.g., "a" -> a, "b" -> b)
+        9. Digit words (e.g., "one" -> 1, "two" -> 2)
+        10. Normal dictation
         """
         text_lower = text.lower().strip().rstrip('.,!?')
         text_clean = text.strip().rstrip('.,!?')
@@ -296,7 +310,21 @@ class CommandProcessor:
         if text_lower in PUNCTUATION_CHARS:
             return CommandResult("literal", PUNCTUATION_CHARS[text_lower])
 
-        # 7. Normal dictation
+        # 7. Spelled-out letters (A-B-C or A B C -> abc)
+        # Returns "none" so it goes through pending text system, not immediate execution
+        spelled = self._parse_spelled_letters(text_lower)
+        if spelled:
+            return CommandResult("none", spelled)
+
+        # 8. Single letters (a, b, c, ...)
+        if text_lower in SINGLE_LETTERS:
+            return CommandResult("literal", SINGLE_LETTERS[text_lower])
+
+        # 9. Digit words (one -> 1, two -> 2, ...)
+        if text_lower in DIGIT_WORDS:
+            return CommandResult("literal", DIGIT_WORDS[text_lower])
+
+        # 10. Normal dictation
         return CommandResult("none", text)
 
     def _normalize_keys(self, keys: str) -> str:
@@ -315,6 +343,68 @@ class CommandProcessor:
             if part:  # Skip empty parts
                 normalized.append(part)
         return "+".join(normalized)
+
+    def _parse_spelled_letters(self, text: str) -> Optional[str]:
+        """
+        Parse spelled-out letters/digits like 'A-B-C' or 'A, B, C' into 'abc'.
+
+        Returns the parsed string if it's a spelling pattern, None otherwise.
+        """
+        # Split on hyphens, commas, or spaces
+        parts = re.split(r'[-,\s]+', text.strip())
+
+        # Filter out empty parts and strip punctuation
+        parts = [p.strip('.,!?') for p in parts if p.strip('.,!?')]
+
+        # Need at least 2 parts to be considered spelling
+        if len(parts) < 2:
+            return None
+
+        result = []
+        for part in parts:
+            part = part.lower()
+            if part in SINGLE_LETTERS:
+                result.append(part)
+            elif part in DIGIT_WORDS:
+                result.append(DIGIT_WORDS[part])
+            elif part.isdigit() and len(part) == 1:
+                result.append(part)
+            else:
+                # Not a valid spelling pattern
+                return None
+
+        return ''.join(result)
+
+
+NOTIFICATION_ID_FILE = Path.home() / ".cache/whisper-typer/notification_id"
+
+
+def close_notification_by_id(notification_id: int):
+    """Close a notification by its ID."""
+    try:
+        subprocess.run([
+            'gdbus', 'call', '--session',
+            '--dest', 'org.freedesktop.Notifications',
+            '--object-path', '/org/freedesktop/Notifications',
+            '--method', 'org.freedesktop.Notifications.CloseNotification',
+            str(notification_id)
+        ], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def cleanup_notification():
+    """atexit handler to close notification from saved ID."""
+    try:
+        if NOTIFICATION_ID_FILE.exists():
+            notification_id = int(NOTIFICATION_ID_FILE.read_text().strip())
+            close_notification_by_id(notification_id)
+            NOTIFICATION_ID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+atexit.register(cleanup_notification)
 
 
 class Notifier:
@@ -335,23 +425,19 @@ class Notifier:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.stdout.strip():
                 self.notification_id = int(result.stdout.strip())
+                # Save to file for cleanup if process is killed
+                NOTIFICATION_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+                NOTIFICATION_ID_FILE.write_text(str(self.notification_id))
         except (FileNotFoundError, ValueError):
             pass
 
     def close(self):
         """Close the current notification."""
         if self.notification_id:
-            try:
-                subprocess.run([
-                    'gdbus', 'call', '--session',
-                    '--dest', 'org.freedesktop.Notifications',
-                    '--object-path', '/org/freedesktop/Notifications',
-                    '--method', 'org.freedesktop.Notifications.CloseNotification',
-                    str(self.notification_id)
-                ], capture_output=True)
-                self.notification_id = None
-            except FileNotFoundError:
-                pass
+            close_notification_by_id(self.notification_id)
+            self.notification_id = None
+        # Clean up the saved ID file
+        NOTIFICATION_ID_FILE.unlink(missing_ok=True)
 
 
 @dataclass
@@ -710,6 +796,21 @@ class WhisperTyperClient:
         self._running = True
         self.notifier.show("🎤 Listening...", persistent=True)
 
+        # Set up signal handlers in the event loop
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def handle_signal():
+            logger.info("Signal received, stopping...")
+            self._running = False
+            stop_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_signal)
+
+        send_task = None
+        recv_task = None
+
         try:
             await self.connect()
             self.mic.start()
@@ -717,23 +818,35 @@ class WhisperTyperClient:
             # Start tasks for sending audio and receiving transcriptions
             send_task = asyncio.create_task(self._send_audio())
             recv_task = asyncio.create_task(self._receive_transcriptions())
+            stop_task = asyncio.create_task(stop_event.wait())
 
-            # Wait for either task to complete (usually due to disconnection)
+            # Wait for either task to complete (usually due to disconnection or signal)
             done, pending = await asyncio.wait(
-                [send_task, recv_task],
+                [send_task, recv_task, stop_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # Cancel pending tasks
+            # Close websocket first to unblock recv()
+            if self._websocket:
+                await self._websocket.close()
+
+            # Cancel and await pending tasks
             for task in pending:
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("Connection closed")
         except Exception as e:
             logger.error(f"Error: {e}")
         finally:
-            self.stop()
+            # Stop mic (this is synchronous)
+            self.mic.stop()
+            self.notifier.close()
+            logger.info("Client stopped")
 
     async def _send_audio(self):
         """Send audio chunks to the server."""
@@ -782,6 +895,17 @@ class WhisperTyperClient:
         num_completed = len(completed_segments)
         prev_completed = self.typer.state.completed_count
 
+        # Detect when server starts a new utterance (segment count resets)
+        # This happens when num_completed drops below our count
+        if num_completed < prev_completed:
+            logger.debug(f"Segment count reset detected: {prev_completed} -> {num_completed}")
+            # If we have pending text that wasn't finalized, finalize it now
+            if self.typer.state.pending_text:
+                logger.debug(f"Finalizing orphaned pending text: {self.typer.state.pending_text!r}")
+                self.typer.finalize_pending()
+            self.typer.state.completed_count = num_completed
+            prev_completed = num_completed
+
         # Process newly completed segments
         if num_completed > prev_completed:
             # Check if pending text is a command before finalizing
@@ -828,7 +952,8 @@ class WhisperTyperClient:
                 self.typer.state.last_command_text = text
             else:
                 # Normal dictation - update pending
-                self.typer.update_pending(text)
+                # Use payload (may be transformed, e.g., spelled letters)
+                self.typer.update_pending(cmd_result.payload)
 
     def _execute_command(self, cmd_result: CommandResult):
         """Execute a voice command."""
@@ -838,15 +963,6 @@ class WhisperTyperClient:
             self.typer.send_keys(cmd_result.payload)
         elif cmd_result.action == "literal":
             self.typer.type_text(cmd_result.payload)
-
-    def stop(self):
-        """Stop the client."""
-        self._running = False
-        self.mic.stop()
-        if self._websocket:
-            asyncio.create_task(self._websocket.close())
-        self.notifier.close()
-        logger.info("Client stopped")
 
 
 def main():
@@ -975,15 +1091,6 @@ CLI arguments override config file settings.
         dry_run=args.dry_run,
         device_index=device_index,
     )
-
-    # Handle Ctrl+C gracefully
-    def signal_handler(sig, frame):
-        logger.info("Shutting down...")
-        client.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
 
     print("=" * 50)
     print("WhisperLive Typer")
