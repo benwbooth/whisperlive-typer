@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -182,6 +183,8 @@ class Config:
     device: str = ""
     vad_onset: float = 0.3
     vad_offset: float = 0.2
+    no_speech_thresh: float = 0.45  # Segments with no_speech_prob above this are filtered (hallucinations)
+    min_avg_logprob: float = -0.8  # Segments with avg_logprob below this are filtered (low confidence)
     commands: dict = None
 
     def __post_init__(self):
@@ -217,6 +220,8 @@ class Config:
                 vad = data.get("vad", {})
                 config.vad_onset = vad.get("onset", config.vad_onset)
                 config.vad_offset = vad.get("offset", config.vad_offset)
+                config.no_speech_thresh = vad.get("no_speech_thresh", config.no_speech_thresh)
+                config.min_avg_logprob = vad.get("min_avg_logprob", config.min_avg_logprob)
 
                 # Commands
                 commands_data = data.get("commands", {})
@@ -272,12 +277,13 @@ class CommandProcessor:
         2. Configured key commands (e.g., "scratch that" -> ctrl+z)
         3. Configured literals
         4. Modifier combos (e.g., "control c" -> ctrl+c)
-        5. Action keys (e.g., "enter", "backspace")
-        6. Punctuation names (e.g., "semicolon" -> ;)
-        7. Spelled-out letters/digits (e.g., "A-B-C" or "A B C" -> abc)
-        8. Single letters (e.g., "a" -> a, "b" -> b)
-        9. Digit words (e.g., "one" -> 1, "two" -> 2)
-        10. Normal dictation
+        5. "press X" (e.g., "press enter", "press tab")
+        6. Action keys (e.g., "enter", "backspace")
+        7. Punctuation names (e.g., "semicolon" -> ;)
+        8. Spelled-out letters/digits (e.g., "A-B-C" or "A B C" -> abc)
+        9. Single letters (e.g., "a" -> a, "b" -> b)
+        10. Digit words (e.g., "one" -> 1, "two" -> 2)
+        11. Normal dictation
         """
         text_lower = text.lower().strip().rstrip('.,!?')
         text_clean = text.strip().rstrip('.,!?')
@@ -302,29 +308,35 @@ class CommandProcessor:
         if words and words[0] in MODIFIER_KEYS:
             return CommandResult("keys", self._normalize_keys(text_lower))
 
-        # 5. Action keys (enter, backspace, tab, etc.)
+        # 5. "press X" prefix for action keys (e.g., "press enter", "press tab")
+        if text_lower.startswith("press "):
+            key_name = text_lower[6:].strip()
+            if key_name in ACTION_KEYS or key_name in KEY_CODES:
+                return CommandResult("keys", self._normalize_keys(key_name))
+
+        # 6. Action keys (enter, backspace, tab, etc.)
         if text_lower in ACTION_KEYS:
             return CommandResult("keys", self._normalize_keys(text_lower))
 
-        # 6. Punctuation names (semicolon -> ;)
+        # 7. Punctuation names (semicolon -> ;)
         if text_lower in PUNCTUATION_CHARS:
             return CommandResult("literal", PUNCTUATION_CHARS[text_lower])
 
-        # 7. Spelled-out letters (A-B-C or A B C -> abc)
+        # 8. Spelled-out letters (A-B-C or A B C -> abc)
         # Returns "none" so it goes through pending text system, not immediate execution
         spelled = self._parse_spelled_letters(text_lower)
         if spelled:
             return CommandResult("none", spelled)
 
-        # 8. Single letters (a, b, c, ...)
+        # 9. Single letters (a, b, c, ...)
         if text_lower in SINGLE_LETTERS:
             return CommandResult("literal", SINGLE_LETTERS[text_lower])
 
-        # 9. Digit words (one -> 1, two -> 2, ...)
+        # 10. Digit words (one -> 1, two -> 2, ...)
         if text_lower in DIGIT_WORDS:
             return CommandResult("literal", DIGIT_WORDS[text_lower])
 
-        # 10. Normal dictation
+        # 11. Normal dictation
         return CommandResult("none", text)
 
     def _normalize_keys(self, keys: str) -> str:
@@ -444,9 +456,21 @@ class Notifier:
 class TyperState:
     """Tracks what has been typed to enable corrections."""
     confirmed_text: str = ""  # Text from completed segments (won't change)
-    pending_text: str = ""     # Text from current in-progress segment
+    screen_text: str = ""      # What's actually on screen (typed out)
+    target_text: str = ""      # What the transcription says it should be
     completed_count: int = 0   # Number of completed segments processed
     last_command_text: str = ""  # Last command text we executed (to prevent re-execution)
+    current_utterance_id: int = -1  # ID of current utterance (from server)
+    last_finalized_text: str = ""  # Text we just finalized (to prevent re-typing duplicates)
+    last_finalized_end: float = -1.0  # End time of last finalized segment
+    last_completed_end: float = -1.0  # End time of latest completed segment
+    last_pending_end: float = -1.0  # End time of current pending segment
+    last_pending_no_speech_prob: float = 0.0  # Cached pending no_speech_prob
+    last_pending_avg_logprob: float = 0.0  # Cached pending avg_logprob
+    last_update_time: float = 0.0  # Time of last screen update (for debouncing)
+
+
+UTTERANCE_GAP_THRESHOLD = 0.8  # seconds of silence to treat as a new utterance
 
 
 class YdotoolTyper:
@@ -485,7 +509,7 @@ class YdotoolTyper:
             return
         logger.info(f"Typing: {text!r}")
         # ydotool type command with minimal delays for speed
-        self._run_ydotool('type', '--key-delay=2', '--key-hold=2', '--clearmodifiers', '--', text)
+        self._run_ydotool('type', '--key-delay=5', '--key-hold=2', '--clearmodifiers', '--', text)
 
     def backspace(self, count: int):
         """Send backspace key presses."""
@@ -494,7 +518,7 @@ class YdotoolTyper:
         # Key code 14 is backspace - send all at once for speed
         # Format: keycode:1 (down) keycode:0 (up)
         keys = ' '.join(['14:1', '14:0'] * count)
-        self._run_ydotool('key', '--key-delay=2', *keys.split())
+        self._run_ydotool('key', '--key-delay=5', *keys.split())
 
     def send_keys(self, keys_str: str):
         """
@@ -554,42 +578,68 @@ class YdotoolTyper:
         for code in reversed(codes):
             key_args.append(f"{code}:0")
 
-        self._run_ydotool('key', '--key-delay=2', *key_args)
+        self._run_ydotool('key', '--key-delay=5', *key_args)
 
-    def update_pending(self, new_text: str):
+    def update_pending(self, new_text: str, force: bool = False):
         """
         Update the pending (in-progress) text, using backspaces to correct.
+        Uses debouncing to avoid rapid-fire updates to ydotool.
 
         Args:
             new_text: The new transcription text for the current segment
+            force: If True, force update even if debounce interval hasn't passed
         """
-        with self._lock:
-            old_text = self.state.pending_text
+        DEBOUNCE_MS = 1000  # Minimum ms between screen updates
 
-            if old_text == new_text:
-                # No change
+        with self._lock:
+            # Always update target_text to track latest transcription
+            self.state.target_text = new_text
+
+            # Check debounce - skip if too soon since last update (unless forced)
+            now = time.time() * 1000  # ms
+            time_since_update = now - self.state.last_update_time
+            if not force and time_since_update < DEBOUNCE_MS:
+                logger.debug(f"Debouncing update ({time_since_update:.0f}ms < {DEBOUNCE_MS}ms)")
                 return
 
-            if not old_text:
-                # Nothing pending yet, just type the new text
-                if new_text:
-                    self.type_text(new_text)
-                    self.state.pending_text = new_text
-                    logger.debug(f"Typed new: {new_text!r}")
+            screen_text = self.state.screen_text
+            target_text = self.state.target_text
+
+            if screen_text == target_text:
+                # Already in sync
+                return
+
+            logger.info(f"update_pending: screen={screen_text!r} -> target={target_text!r}")
+
+            if not screen_text:
+                # Nothing on screen yet, just type the new text
+                if target_text:
+                    self.type_text(target_text)
+                    self.state.screen_text = target_text
+                    self.state.last_update_time = now
+                    logger.debug(f"Typed new: {target_text!r}")
                 return
 
             # Find common prefix length
             common_len = 0
-            min_len = min(len(old_text), len(new_text))
+            min_len = min(len(screen_text), len(target_text))
             for i in range(min_len):
-                if old_text[i] == new_text[i]:
+                if screen_text[i] == target_text[i]:
                     common_len = i + 1
                 else:
                     break
 
-            # Calculate what needs to be deleted and added
-            chars_to_delete = len(old_text) - common_len
-            chars_to_add = new_text[common_len:]
+            chars_to_delete = len(screen_text) - common_len
+            chars_to_add = target_text[common_len:]
+
+            # SAFETY: Never delete more than pending text length
+            # confirmed_text is sacred - never touch it
+            max_deletable = len(self.state.screen_text)
+            if chars_to_delete > max_deletable:
+                logger.warning(f"Clamping delete from {chars_to_delete} to {max_deletable} (boundary protection)")
+                chars_to_delete = max_deletable
+
+            logger.info(f"Diff: common_len={common_len}, delete={chars_to_delete}, add={len(chars_to_add)}")
 
             if chars_to_delete > 0:
                 logger.debug(f"Backspacing {chars_to_delete} chars")
@@ -599,26 +649,46 @@ class YdotoolTyper:
                 logger.debug(f"Typing: {chars_to_add!r}")
                 self.type_text(chars_to_add)
 
-            self.state.pending_text = new_text
+            self.state.screen_text = target_text
+            self.state.last_update_time = now
 
-    def finalize_pending(self):
+    def finalize_pending(self, final_end: Optional[float] = None):
         """Finalize the current pending text (segment completed)."""
+        # First, force sync screen to target (in case debounced updates are pending)
+        if self.state.target_text != self.state.screen_text:
+            self.update_pending(self.state.target_text, force=True)
+
         with self._lock:
-            if self.state.pending_text:
+            if self.state.screen_text:
                 # Add space after completed segment
                 self.type_text(" ")
-                self.state.confirmed_text += self.state.pending_text + " "
-                logger.info(f"Finalized: {self.state.pending_text!r}")
-                self.state.pending_text = ""
+                self.state.confirmed_text += self.state.screen_text + " "
+                self.state.last_finalized_text = self.state.screen_text  # Track to prevent re-typing
+                if self.state.last_pending_end >= 0:
+                    self.state.last_finalized_end = self.state.last_pending_end
+                elif final_end is not None:
+                    self.state.last_finalized_end = final_end
+                else:
+                    self.state.last_finalized_end = -1.0
+                logger.info(f"Finalized: {self.state.screen_text!r}")
+                self.state.screen_text = ""
+                self.state.target_text = ""
+                self.state.last_pending_end = -1.0
+                self.state.last_pending_no_speech_prob = 0.0
+                self.state.last_pending_avg_logprob = 0.0
             self.state.completed_count += 1
 
     def clear_pending(self):
         """Clear pending text without finalizing (e.g., segment was empty)."""
         with self._lock:
-            if self.state.pending_text:
-                # Backspace to remove unfinalied text
-                self.backspace(len(self.state.pending_text))
-                self.state.pending_text = ""
+            if self.state.screen_text:
+                # Backspace to remove unfinalized text
+                self.backspace(len(self.state.screen_text))
+            self.state.screen_text = ""
+            self.state.target_text = ""
+            self.state.last_pending_end = -1.0
+            self.state.last_pending_no_speech_prob = 0.0
+            self.state.last_pending_avg_logprob = 0.0
 
 
 class MicrophoneStream:
@@ -626,18 +696,19 @@ class MicrophoneStream:
 
     def __init__(
         self,
-        sample_rate: int = 16000,
+        target_sample_rate: int = 16000,
         chunk_size: int = 1024,
         channels: int = 1,
         device_index: Optional[int] = None,
     ):
-        self.sample_rate = sample_rate
+        self.target_sample_rate = target_sample_rate
         self.chunk_size = chunk_size
         self.channels = channels
         self.device_index = device_index
         self.stream = None
         self._running = False
         self._queue: queue.Queue = queue.Queue()
+        self._device_sample_rate: Optional[int] = None
 
     @classmethod
     def list_devices(cls) -> list[dict]:
@@ -691,24 +762,56 @@ class MicrophoneStream:
             print("Use --list-devices to see available devices.")
             return None
 
+    def _resample(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio using linear interpolation."""
+        if orig_sr == target_sr:
+            return audio
+        # Calculate the number of output samples
+        duration = len(audio) / orig_sr
+        target_length = int(duration * target_sr)
+        # Use numpy interpolation for resampling
+        orig_indices = np.arange(len(audio))
+        target_indices = np.linspace(0, len(audio) - 1, target_length)
+        return np.interp(target_indices, orig_indices, audio.flatten()).astype(np.float32)
+
     def _audio_callback(self, indata, frames, time, status):
         """Callback for sounddevice stream."""
         if status:
             logger.warning(f"Audio status: {status}")
-        # Send float32 audio directly (WhisperLive expects float32 in -1 to 1 range)
-        self._queue.put(indata.astype(np.float32).tobytes())
+        # Resample if needed and send float32 audio
+        audio = indata.flatten().astype(np.float32)
+        if self._device_sample_rate and self._device_sample_rate != self.target_sample_rate:
+            audio = self._resample(audio, self._device_sample_rate, self.target_sample_rate)
+        self._queue.put(audio.tobytes())
 
     def start(self):
         """Start the audio stream."""
+        # Get device info
+        dev_name = "default"
         if self.device_index is not None:
             dev_info = sd.query_devices(self.device_index)
-            logger.info(f"Using device: {dev_info['name']}")
+            dev_name = dev_info['name']
+            logger.info(f"Using device: {dev_name}")
+
+        # For pipewire/pulseaudio/default, request target rate directly (they handle conversion)
+        # For hardware devices (hw:), use native rate and resample ourselves
+        use_native_rate = dev_name.startswith('hw:') or '(hw:' in dev_name
+
+        if use_native_rate and self.device_index is not None:
+            dev_info = sd.query_devices(self.device_index)
+            self._device_sample_rate = int(dev_info['default_samplerate'])
+            device_chunk_size = int(self.chunk_size * self._device_sample_rate / self.target_sample_rate)
+            logger.info(f"Hardware device at {self._device_sample_rate} Hz, will resample to {self.target_sample_rate} Hz")
+        else:
+            self._device_sample_rate = self.target_sample_rate
+            device_chunk_size = self.chunk_size
+            logger.info(f"Using {self.target_sample_rate} Hz directly")
 
         self.stream = sd.InputStream(
-            samplerate=self.sample_rate,
+            samplerate=self._device_sample_rate,
             channels=self.channels,
             device=self.device_index,
-            blocksize=self.chunk_size,
+            blocksize=device_chunk_size,
             dtype=np.float32,
             callback=self._audio_callback,
         )
@@ -757,6 +860,8 @@ class WhisperTyperClient:
         self.model = config.model
         self.vad_onset = config.vad_onset
         self.vad_offset = config.vad_offset
+        self.no_speech_thresh = config.no_speech_thresh
+        self.min_avg_logprob = config.min_avg_logprob
         self.typer = typer or YdotoolTyper(dry_run=dry_run)
         self.mic = MicrophoneStream(device_index=device_index)
         self.notifier = Notifier()
@@ -780,6 +885,7 @@ class WhisperTyperClient:
             "task": "transcribe",
             "model": self.model,
             "use_vad": True,
+            "no_speech_thresh": self.no_speech_thresh,
             "vad_parameters": {
                 "onset": self.vad_onset,
                 "offset": self.vad_offset,
@@ -876,6 +982,50 @@ class WhisperTyperClient:
                 logger.error(f"Error receiving: {e}")
                 break
 
+    @staticmethod
+    def _parse_segment_time(value: Optional[object]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_cmd_text(text: str) -> str:
+        return text.lower().rstrip('.,!?')
+
+    def _segment_passes_filters(self, segment: dict) -> bool:
+        no_speech_prob = float(segment.get("no_speech_prob", 0))
+        avg_logprob = float(segment.get("avg_logprob", 0))
+        return no_speech_prob <= self.no_speech_thresh and avg_logprob >= self.min_avg_logprob
+
+    def _get_last_audio_end(self) -> float:
+        candidates = (
+            self.typer.state.last_pending_end,
+            self.typer.state.last_completed_end,
+            self.typer.state.last_finalized_end,
+        )
+        return max((c for c in candidates if c >= 0), default=-1.0)
+
+    def _is_duplicate_finalized(
+        self,
+        text: str,
+        pending_start: Optional[float],
+        pending_end: Optional[float],
+    ) -> bool:
+        if not text or not self.typer.state.last_finalized_text:
+            return False
+        if text != self.typer.state.last_finalized_text:
+            return False
+        if self.typer.state.last_finalized_end < 0:
+            return False
+        if pending_end is not None and pending_end <= self.typer.state.last_finalized_end + 1e-3:
+            return True
+        if pending_start is not None and pending_start <= self.typer.state.last_finalized_end + 1e-3:
+            return True
+        return False
+
     def _handle_transcription(self, data: dict):
         """Process a transcription message from the server."""
         logger.debug(f"Handling data: {data}")
@@ -888,55 +1038,104 @@ class WhisperTyperClient:
             logger.debug("Empty segments list")
             return
 
-        # Count completed segments
         completed_segments = [s for s in segments if s.get("completed", False)]
         pending_segments = [s for s in segments if not s.get("completed", False)]
 
-        num_completed = len(completed_segments)
-        prev_completed = self.typer.state.completed_count
-
-        # Detect when server starts a new utterance (segment count resets)
-        # This happens when num_completed drops below our count
-        if num_completed < prev_completed:
-            logger.debug(f"Segment count reset detected: {prev_completed} -> {num_completed}")
-            # If we have pending text that wasn't finalized, finalize it now
-            if self.typer.state.pending_text:
-                logger.debug(f"Finalizing orphaned pending text: {self.typer.state.pending_text!r}")
-                self.typer.finalize_pending()
-            self.typer.state.completed_count = num_completed
-            prev_completed = num_completed
-
-        # Process newly completed segments
-        if num_completed > prev_completed:
-            # Check if pending text is a command before finalizing
-            pending_text = self.typer.state.pending_text.strip()
-            if pending_text:
-                cmd_result = self.commands.process(pending_text)
-                if cmd_result.action != "none":
-                    # It's a command - clear pending and execute
+        latest_completed = completed_segments[-1] if completed_segments else None
+        completed_end = (
+            self._parse_segment_time(latest_completed.get("end"))
+            if latest_completed
+            else None
+        )
+        if completed_end is not None:
+            if completed_end + 1e-3 < self.typer.state.last_completed_end:
+                logger.debug(
+                    "Completed segment time reset: "
+                    f"{self.typer.state.last_completed_end:.3f} -> {completed_end:.3f}"
+                )
+                self.typer.state.last_completed_end = completed_end
+            elif completed_end > self.typer.state.last_completed_end + 1e-3:
+                if latest_completed and not self._segment_passes_filters(latest_completed):
+                    no_speech_prob = float(latest_completed.get("no_speech_prob", 0))
+                    avg_logprob = float(latest_completed.get("avg_logprob", 0))
+                    logger.info(
+                        "Skipping low-confidence completed segment: "
+                        f"no_speech_prob={no_speech_prob:.3f}, avg_logprob={avg_logprob:.3f}"
+                    )
                     self.typer.clear_pending()
-                    self._execute_command(cmd_result)
                 else:
-                    # Normal text - finalize it
-                    self.typer.finalize_pending()
-            # Update our count and reset command tracking for next segment
-            self.typer.state.completed_count = num_completed
-            self.typer.state.last_command_text = ""
-            logger.debug(f"Completed segments: {prev_completed} -> {num_completed}")
+                    pending_text = (self.typer.state.target_text or self.typer.state.screen_text).strip()
+                    if pending_text:
+                        cmd_result = self.commands.process(pending_text)
+                        if cmd_result.action != "none":
+                            if (
+                                not self.typer.state.last_command_text
+                                or self._normalize_cmd_text(pending_text)
+                                != self._normalize_cmd_text(self.typer.state.last_command_text)
+                            ):
+                                self.typer.clear_pending()
+                                self._execute_command(cmd_result)
+                                self.typer.state.last_command_text = pending_text
+                            else:
+                                self.typer.clear_pending()
+                        else:
+                            self.typer.finalize_pending(final_end=completed_end)
+                self.typer.state.last_completed_end = completed_end
+                self.typer.state.last_command_text = ""
 
         # Handle the current in-progress segment
         if pending_segments:
             current = pending_segments[-1]
             text = current.get("text", "").strip()
-            logger.info(f"Segment: text={text!r}, completed=False")
+            no_speech_prob = float(current.get("no_speech_prob", 0))
+            avg_logprob = float(current.get("avg_logprob", 0))
+            pending_start = self._parse_segment_time(current.get("start"))
+            pending_end = self._parse_segment_time(current.get("end"))
+
+            # Filter out likely hallucinations based on no_speech_prob
+            if no_speech_prob > self.no_speech_thresh:
+                logger.info(f"Filtering hallucination: {text!r} (no_speech_prob={no_speech_prob:.3f} > {self.no_speech_thresh})")
+                # Clear any stale pending state to prevent mismatch with server state
+                self.typer.clear_pending()
+                return
+
+            # Filter out low-confidence segments based on avg_logprob
+            if avg_logprob < self.min_avg_logprob:
+                logger.info(f"Filtering low-confidence: {text!r} (avg_logprob={avg_logprob:.3f} < {self.min_avg_logprob})")
+                # Clear any stale pending state to prevent mismatch with server state
+                self.typer.clear_pending()
+                return
+
+            utterance_id = int(current.get("utterance_id", 0))
+            logger.info(f"Segment: text={text!r}, utterance_id={utterance_id}, avg_logprob={avg_logprob:.2f}")
+
+            last_end = self._get_last_audio_end()
+            if pending_start is not None and last_end >= 0:
+                gap = pending_start - last_end
+                if gap > UTTERANCE_GAP_THRESHOLD:
+                    logger.info(f"New utterance detected: gap={gap:.2f}s")
+                    if self.typer.state.screen_text or self.typer.state.target_text:
+                        self.typer.finalize_pending()
+
+            self.typer.state.current_utterance_id = utterance_id
+            if pending_end is not None:
+                self.typer.state.last_pending_end = pending_end
+            else:
+                self.typer.state.last_pending_end = -1.0
+            self.typer.state.last_pending_no_speech_prob = no_speech_prob
+            self.typer.state.last_pending_avg_logprob = avg_logprob
+
+            # Skip if this text duplicates what we just finalized (prevents re-typing)
+            if self._is_duplicate_finalized(text, pending_start, pending_end):
+                logger.info(f"Skipping duplicate of finalized text: {text!r}")
+                return
 
             # Skip if we already executed a command for this text
             # (prevents re-execution as segment updates with same/similar content)
-            # Normalize by lowercasing and stripping punctuation for comparison
-            def normalize_cmd(s: str) -> str:
-                return s.lower().rstrip('.,!?')
-
-            if self.typer.state.last_command_text and normalize_cmd(text) == normalize_cmd(self.typer.state.last_command_text):
+            if (
+                self.typer.state.last_command_text
+                and self._normalize_cmd_text(text) == self._normalize_cmd_text(self.typer.state.last_command_text)
+            ):
                 logger.debug(f"Skipping already-executed command: {text!r}")
                 return
 
@@ -945,7 +1144,7 @@ class WhisperTyperClient:
             if cmd_result.action in ("keys", "literal"):
                 # Execute commands immediately
                 # Clear any existing pending text first
-                if self.typer.state.pending_text:
+                if self.typer.state.screen_text:
                     self.typer.clear_pending()
                 self._execute_command(cmd_result)
                 # Track that we executed this command to prevent re-execution
@@ -1099,6 +1298,7 @@ CLI arguments override config file settings.
     print(f"Language: {config.language}")
     print(f"Model: {config.model}")
     print(f"VAD: onset={config.vad_onset}, offset={config.vad_offset}")
+    print(f"Filters: no_speech_thresh={config.no_speech_thresh}, min_avg_logprob={config.min_avg_logprob}")
     if device_index is not None:
         devices = MicrophoneStream.list_devices()
         dev_name = next((d['name'] for d in devices if d['index'] == device_index), f"Device {device_index}")

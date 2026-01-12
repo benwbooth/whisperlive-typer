@@ -77,6 +77,9 @@ RUN git clone https://github.com/collabora/WhisperLive.git /app/WhisperLive && \
     pip install --no-cache-dir --no-deps -e . && \
     pip install --no-cache-dir scipy ffmpeg-python onnxruntime
 
+# Apply patch to expose confidence fields (no_speech_prob, avg_logprob) in segment JSON
+COPY patches/base.py /app/WhisperLive/whisper_live/backend/base.py
+
 # Cleanup build directory to reduce image size
 RUN rm -rf /build
 
