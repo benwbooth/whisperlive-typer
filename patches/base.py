@@ -29,9 +29,9 @@ class ServeClientBase(object):
         client_uid,
         websocket,
         send_last_n_segments=10,
-        no_speech_thresh=0.45,
+        no_speech_thresh=0.35,
         clip_audio=False,
-        same_output_threshold=10,
+        same_output_threshold=4,
         translation_queue=None,
     ):
         self.client_uid = client_uid
@@ -54,10 +54,11 @@ class ServeClientBase(object):
         self.end_time_for_same_output = None
         self.translation_queue = translation_queue
 
-        # Utterance tracking
-        self.utterance_id = 0  # Increments when a new utterance starts
-        self.last_segment_end = 0.0  # Track end time to detect gaps
-        self.pending_gap_active = False  # Prevent repeated gap-triggered utterance increments
+        # Segment tracking for duplicate detection
+        self.last_segment_end = 0.0  # Track end time to detect gaps and duplicates
+
+        # For sending finalized text to client
+        self.finalized_to_send = None  # Set by update_segments, used by send_transcription_to_client
 
         # threading
         self.lock = threading.Lock()
@@ -134,7 +135,6 @@ class ServeClientBase(object):
             'completed': completed,
             'no_speech_prob': no_speech_prob,
             'avg_logprob': avg_logprob,
-            'utterance_id': self.utterance_id,
         }
 
     def add_frames(self, frame_np):
@@ -238,21 +238,31 @@ class ServeClientBase(object):
 
     def send_transcription_to_client(self, segments):
         """
-        Sends the specified transcription segments to the client over the websocket connection.
+        Sends transcription update to the client over the websocket connection.
 
-        This method formats the transcription segments into a JSON object and attempts to send
-        this object to the client. If an error occurs during the send operation, it logs the error.
+        Simple protocol:
+        - finalize: text that is now final (client should type and never delete)
+        - text: current pending text (client can update via diff)
 
-        Returns:
-            segments (list): A list of transcription segments to be sent to the client.
+        Args:
+            segments: List of segment dicts for backward compatibility
         """
+        msg = {"uid": self.client_uid}
+
+        # Include finalized text if any was set by update_segments
+        if self.finalized_to_send:
+            msg["finalize"] = self.finalized_to_send
+            self.finalized_to_send = None  # Clear after sending
+
+        # Include current pending text
+        if self.current_out:
+            msg["text"] = self.current_out
+
+        # Keep segments for backward compatibility / debugging
+        msg["segments"] = segments
+
         try:
-            self.websocket.send(
-                json.dumps({
-                    "uid": self.client_uid,
-                    "segments": segments,
-                })
-            )
+            self.websocket.send(json.dumps(msg))
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}")
 
@@ -296,7 +306,10 @@ class ServeClientBase(object):
     def update_segments(self, segments, duration):
         """
         Processes the segments from Whisper and updates the transcript.
-        Uses helper methods to account for differences between backends.
+
+        Simplified protocol:
+        - When segments complete, send {finalize: text} for each completed segment
+        - Always send {text: pending} with current pending text
 
         Args:
             segments (list): List of segments returned by the transcriber.
@@ -305,20 +318,20 @@ class ServeClientBase(object):
         Returns:
             dict or None: The last processed segment (if any).
         """
-        UTTERANCE_GAP_THRESHOLD = 0.8  # seconds of silence to consider a new utterance
-
         offset = None
         self.current_out = ''
         last_segment = None
+        finalized_texts = []  # Collect all finalized texts to send
 
         logging.info(f"update_segments: len={len(segments)}, duration={duration:.2f}, timestamp_offset={self.timestamp_offset:.2f}")
+        for i, s in enumerate(segments):
+            logging.info(f"  seg[{i}]: '{s.text}' start={self.get_segment_start(s):.2f} end={self.get_segment_end(s):.2f} no_speech={self.get_segment_no_speech_prob(s):.2f}")
 
         # Process complete segments only if there are more than one
         # and if the last segment's no_speech_prob is below the threshold.
         if len(segments) > 1 and self.get_segment_no_speech_prob(segments[-1]) <= self.no_speech_thresh:
             for s in segments[:-1]:
                 text_ = s.text
-                self.text.append(text_)
                 with self.lock:
                     start = self.timestamp_offset + self.get_segment_start(s)
                     end = self.timestamp_offset + min(duration, self.get_segment_end(s))
@@ -327,14 +340,14 @@ class ServeClientBase(object):
                 if self.get_segment_no_speech_prob(s) > self.no_speech_thresh:
                     continue
 
-                # Detect new utterance based on gap in speech
-                if self.last_segment_end > 0 and start - self.last_segment_end > UTTERANCE_GAP_THRESHOLD:
-                    if not self.pending_gap_active:
-                        self.utterance_id += 1
-                        logging.debug(
-                            f"New utterance detected: gap={start - self.last_segment_end:.2f}s, "
-                            f"id={self.utterance_id}"
-                        )
+                # Skip segments we've already processed (prevents duplicate finalization)
+                if self.last_segment_end > 0 and start < self.last_segment_end - 0.1:
+                    logging.debug(f"  Skipping already-processed segment: start={start:.2f} < last_end={self.last_segment_end:.2f}")
+                    continue
+
+                # This segment is newly completed - add to finalized list
+                self.text.append(text_)
+                finalized_texts.append(text_)
 
                 completed_segment = self.format_segment(
                     start, end, text_, completed=True,
@@ -342,8 +355,7 @@ class ServeClientBase(object):
                     avg_logprob=self.get_segment_avg_logprob(s),
                 )
                 self.transcript.append(completed_segment)
-                self.last_segment_end = end  # Track for gap detection
-                self.pending_gap_active = False
+                self.last_segment_end = end
 
                 if self.translation_queue:
                     try:
@@ -351,29 +363,15 @@ class ServeClientBase(object):
                     except queue.Full:
                         logging.warning("Translation queue is full, skipping segment")
                 offset = min(duration, self.get_segment_end(s))
-                logging.info(f"  Completed segment: end={self.get_segment_end(s):.2f}, offset={offset:.2f}")
+                logging.info(f"  Completed segment: '{text_}' end={end:.2f}, offset={offset:.2f}")
 
-        # Process the last segment if its no_speech_prob is acceptable.
+        # Process the last segment as pending if its no_speech_prob is acceptable.
         if self.get_segment_no_speech_prob(segments[-1]) <= self.no_speech_thresh:
             with self.lock:
                 pending_start = self.timestamp_offset + self.get_segment_start(segments[-1])
                 pending_end = self.timestamp_offset + min(duration, self.get_segment_end(segments[-1]))
 
-            # Detect new utterance based on gap before pending segment
-            if self.last_segment_end > 0:
-                gap = pending_start - self.last_segment_end
-                if gap > UTTERANCE_GAP_THRESHOLD:
-                    if not self.pending_gap_active:
-                        self.utterance_id += 1
-                        self.pending_gap_active = True
-                        logging.debug(
-                            f"New utterance detected (pending): gap={gap:.2f}s, "
-                            f"id={self.utterance_id}"
-                        )
-                else:
-                    self.pending_gap_active = False
-
-            self.current_out = segments[-1].text  # Use = not += to avoid accumulation
+            self.current_out = segments[-1].text
             with self.lock:
                 last_segment = self.format_segment(
                     pending_start, pending_end,
@@ -383,53 +381,43 @@ class ServeClientBase(object):
                     avg_logprob=self.get_segment_avg_logprob(segments[-1]),
                 )
         else:
-            self.pending_gap_active = False
+            # High no_speech_prob - likely hallucination, clear pending
+            self.current_out = ""
+            logging.debug(f"  Clearing pending due to high no_speech_prob: {self.get_segment_no_speech_prob(segments[-1]):.2f}")
 
-        # Handle repeated output logic.
+        # Handle repeated output logic (stall detection)
         if self.current_out.strip() == self.prev_out.strip() and self.current_out != '':
             self.same_output_count += 1
-
-            # if we remove the audio because of same output on the nth reptition we might remove the
-            # audio thats not yet transcribed so, capturing the time when it was repeated for the first time
             if self.end_time_for_same_output is None:
                 self.end_time_for_same_output = self.get_segment_end(segments[-1])
-            time.sleep(0.1)  # wait briefly for any new voice activity
+            time.sleep(0.1)
         else:
             self.same_output_count = 0
             self.end_time_for_same_output = None
 
-        # If the same incomplete segment is repeated too many times,
-        # append it to the transcript and update the offset.
+        # If the same incomplete segment is repeated too many times, finalize it
         if self.same_output_count > self.same_output_threshold:
             last_no_speech = self.get_segment_no_speech_prob(segments[-1])
 
             # Don't finalize if borderline no_speech_prob (likely hallucination)
-            # Use stricter threshold (0.3) for repeated content
             if last_no_speech > 0.3:
                 logging.info(f"  Skipping repeated hallucination: '{self.current_out}' no_speech_prob={last_no_speech:.2f}")
-                # Still advance past it to prevent re-processing, but don't finalize
                 offset = min(duration, self.end_time_for_same_output)
             elif not self.text or self.text[-1].strip().lower() != self.current_out.strip().lower():
+                # Finalize the repeated pending segment
                 self.text.append(self.current_out)
+                finalized_texts.append(self.current_out)
+
                 with self.lock:
                     seg_start = self.timestamp_offset
                     seg_end = self.timestamp_offset + min(duration, self.end_time_for_same_output)
-
-                    # Detect new utterance based on gap in speech
-                    if self.last_segment_end > 0 and seg_start - self.last_segment_end > UTTERANCE_GAP_THRESHOLD:
-                        self.utterance_id += 1
-                        logging.debug(f"New utterance detected: gap={seg_start - self.last_segment_end:.2f}s, id={self.utterance_id}")
-
                     completed_segment = self.format_segment(
-                        seg_start, seg_end,
-                        self.current_out,
-                        completed=True,
+                        seg_start, seg_end, self.current_out, completed=True,
                         no_speech_prob=last_no_speech,
                         avg_logprob=self.get_segment_avg_logprob(segments[-1]),
                     )
                     self.transcript.append(completed_segment)
-                    self.last_segment_end = seg_end  # Track for gap detection
-                    self.pending_gap_active = False
+                    self.last_segment_end = seg_end
 
                     if self.translation_queue:
                         try:
@@ -438,6 +426,7 @@ class ServeClientBase(object):
                             logging.warning("Translation queue is full, skipping segment")
 
                 offset = min(duration, self.end_time_for_same_output)
+                logging.info(f"  Finalized repeated segment: '{self.current_out}'")
 
             self.current_out = ''
             self.same_output_count = 0
@@ -446,12 +435,25 @@ class ServeClientBase(object):
         else:
             self.prev_out = self.current_out
 
+        # Advance timestamp_offset
         if offset is not None:
             with self.lock:
                 old_offset = self.timestamp_offset
                 self.timestamp_offset += offset
                 logging.info(f"  Advanced timestamp_offset: {old_offset:.2f} + {offset:.2f} = {self.timestamp_offset:.2f}")
-        else:
-            logging.warning(f"  offset is None! No advancement. len(segments)={len(segments)}")
+        elif len(segments) == 1:
+            # Single segment - advance conservatively to prevent buffer overflow
+            seg_start = self.get_segment_start(segments[0])
+            if seg_start > 0.5:
+                conservative_advance = seg_start - 0.5
+                with self.lock:
+                    old_offset = self.timestamp_offset
+                    self.timestamp_offset += conservative_advance
+                    logging.info(f"  Single-segment conservative advance: {old_offset:.2f} + {conservative_advance:.2f} = {self.timestamp_offset:.2f}")
+
+        # Store finalized text for send_transcription_to_client to use
+        if finalized_texts:
+            self.finalized_to_send = ''.join(finalized_texts)
+            logging.info(f"  Finalized text queued: '{self.finalized_to_send}'")
 
         return last_segment

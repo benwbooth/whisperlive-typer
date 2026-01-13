@@ -50,8 +50,8 @@ RUN git clone --recursive https://github.com/arlo-phoenix/CTranslate2-rocm.git &
     ldconfig
 
 # Set library paths for Python bindings build
-ENV LIBRARY_PATH=/usr/local/lib:${LIBRARY_PATH}
-ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+ENV LIBRARY_PATH=/usr/local/lib:${LIBRARY_PATH:-}
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
 
 # Install CTranslate2 Python bindings
 # Build wheel from source

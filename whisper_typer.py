@@ -454,23 +454,15 @@ class Notifier:
 
 @dataclass
 class TyperState:
-    """Tracks what has been typed to enable corrections."""
-    confirmed_text: str = ""  # Text from completed segments (won't change)
-    screen_text: str = ""      # What's actually on screen (typed out)
-    target_text: str = ""      # What the transcription says it should be
-    completed_count: int = 0   # Number of completed segments processed
+    """Tracks what has been typed to enable corrections.
+
+    Simple protocol:
+    - finalized_length: characters that are permanent (never delete before this)
+    - pending_text: current pending text (can be updated via diff)
+    """
+    finalized_length: int = 0  # Characters typed that are permanent
+    pending_text: str = ""     # Current pending text (can change)
     last_command_text: str = ""  # Last command text we executed (to prevent re-execution)
-    current_utterance_id: int = -1  # ID of current utterance (from server)
-    last_finalized_text: str = ""  # Text we just finalized (to prevent re-typing duplicates)
-    last_finalized_end: float = -1.0  # End time of last finalized segment
-    last_completed_end: float = -1.0  # End time of latest completed segment
-    last_pending_end: float = -1.0  # End time of current pending segment
-    last_pending_no_speech_prob: float = 0.0  # Cached pending no_speech_prob
-    last_pending_avg_logprob: float = 0.0  # Cached pending avg_logprob
-    last_update_time: float = 0.0  # Time of last screen update (for debouncing)
-
-
-UTTERANCE_GAP_THRESHOLD = 0.8  # seconds of silence to treat as a new utterance
 
 
 class YdotoolTyper:
@@ -580,115 +572,115 @@ class YdotoolTyper:
 
         self._run_ydotool('key', '--key-delay=5', *key_args)
 
-    def update_pending(self, new_text: str, force: bool = False):
+    def handle_finalize(self, text: str):
         """
-        Update the pending (in-progress) text, using backspaces to correct.
-        Uses debouncing to avoid rapid-fire updates to ydotool.
+        Handle finalized text from server - type it and mark as permanent.
 
         Args:
-            new_text: The new transcription text for the current segment
-            force: If True, force update even if debounce interval hasn't passed
+            text: Text that is now finalized (will never be deleted)
         """
-        DEBOUNCE_MS = 1000  # Minimum ms between screen updates
-
         with self._lock:
-            # Always update target_text to track latest transcription
-            self.state.target_text = new_text
+            pending = self.state.pending_text
 
-            # Check debounce - skip if too soon since last update (unless forced)
-            now = time.time() * 1000  # ms
-            time_since_update = now - self.state.last_update_time
-            if not force and time_since_update < DEBOUNCE_MS:
-                logger.debug(f"Debouncing update ({time_since_update:.0f}ms < {DEBOUNCE_MS}ms)")
+            if not text:
+                # Nothing to finalize, just clear pending
+                if pending:
+                    self.backspace(len(pending))
+                    self.state.pending_text = ""
                 return
 
-            screen_text = self.state.screen_text
-            target_text = self.state.target_text
-
-            if screen_text == target_text:
-                # Already in sync
+            # Optimize: if finalized text starts with pending, just type the rest
+            if pending and text.startswith(pending):
+                # Pending is already on screen, just add the remainder
+                remainder = text[len(pending):]
+                if remainder:
+                    logger.info(f"Finalizing (appending): {remainder!r}")
+                    self.type_text(remainder)
+                else:
+                    logger.info(f"Finalizing (already typed): {text!r}")
+                self.state.pending_text = ""
+                self.state.finalized_length += len(text)
                 return
 
-            logger.info(f"update_pending: screen={screen_text!r} -> target={target_text!r}")
-
-            if not screen_text:
-                # Nothing on screen yet, just type the new text
-                if target_text:
-                    self.type_text(target_text)
-                    self.state.screen_text = target_text
-                    self.state.last_update_time = now
-                    logger.debug(f"Typed new: {target_text!r}")
+            # Optimize: if pending starts with finalized, backspace the extra
+            if pending and pending.startswith(text):
+                extra = len(pending) - len(text)
+                if extra > 0:
+                    logger.info(f"Finalizing (trimming {extra} chars): {text!r}")
+                    self.backspace(extra)
+                else:
+                    logger.info(f"Finalizing (exact match): {text!r}")
+                self.state.pending_text = ""
+                self.state.finalized_length += len(text)
                 return
 
-            # Find common prefix length
+            # General case: clear pending and type finalized
+            if pending:
+                logger.info(f"Clearing pending before finalize: {pending!r}")
+                self.backspace(len(pending))
+                self.state.pending_text = ""
+
+            logger.info(f"Finalizing: {text!r}")
+            self.type_text(text)
+            self.state.finalized_length += len(text)
+
+    def update_pending(self, new_text: str):
+        """
+        Update pending text using diff/backspace.
+
+        Args:
+            new_text: The new pending text from server
+        """
+        with self._lock:
+            old = self.state.pending_text
+
+            if old == new_text:
+                # No change
+                return
+
+            logger.info(f"update_pending: {old!r} -> {new_text!r}")
+
+            if not old:
+                # No previous pending, just type
+                if new_text:
+                    self.type_text(new_text)
+                    self.state.pending_text = new_text
+                return
+
+            if not new_text:
+                # Clear pending
+                self.backspace(len(old))
+                self.state.pending_text = ""
+                return
+
+            # Find common prefix
             common_len = 0
-            min_len = min(len(screen_text), len(target_text))
+            min_len = min(len(old), len(new_text))
             for i in range(min_len):
-                if screen_text[i] == target_text[i]:
+                if old[i] == new_text[i]:
                     common_len = i + 1
                 else:
                     break
 
-            chars_to_delete = len(screen_text) - common_len
-            chars_to_add = target_text[common_len:]
+            to_delete = len(old) - common_len
+            to_add = new_text[common_len:]
 
-            # SAFETY: Never delete more than pending text length
-            # confirmed_text is sacred - never touch it
-            max_deletable = len(self.state.screen_text)
-            if chars_to_delete > max_deletable:
-                logger.warning(f"Clamping delete from {chars_to_delete} to {max_deletable} (boundary protection)")
-                chars_to_delete = max_deletable
+            logger.info(f"Pending diff: common={common_len}, delete={to_delete}, add={len(to_add)}")
 
-            logger.info(f"Diff: common_len={common_len}, delete={chars_to_delete}, add={len(chars_to_add)}")
+            if to_delete > 0:
+                self.backspace(to_delete)
 
-            if chars_to_delete > 0:
-                logger.debug(f"Backspacing {chars_to_delete} chars")
-                self.backspace(chars_to_delete)
+            if to_add:
+                self.type_text(to_add)
 
-            if chars_to_add:
-                logger.debug(f"Typing: {chars_to_add!r}")
-                self.type_text(chars_to_add)
-
-            self.state.screen_text = target_text
-            self.state.last_update_time = now
-
-    def finalize_pending(self, final_end: Optional[float] = None):
-        """Finalize the current pending text (segment completed)."""
-        # First, force sync screen to target (in case debounced updates are pending)
-        if self.state.target_text != self.state.screen_text:
-            self.update_pending(self.state.target_text, force=True)
-
-        with self._lock:
-            if self.state.screen_text:
-                # Add space after completed segment
-                self.type_text(" ")
-                self.state.confirmed_text += self.state.screen_text + " "
-                self.state.last_finalized_text = self.state.screen_text  # Track to prevent re-typing
-                if self.state.last_pending_end >= 0:
-                    self.state.last_finalized_end = self.state.last_pending_end
-                elif final_end is not None:
-                    self.state.last_finalized_end = final_end
-                else:
-                    self.state.last_finalized_end = -1.0
-                logger.info(f"Finalized: {self.state.screen_text!r}")
-                self.state.screen_text = ""
-                self.state.target_text = ""
-                self.state.last_pending_end = -1.0
-                self.state.last_pending_no_speech_prob = 0.0
-                self.state.last_pending_avg_logprob = 0.0
-            self.state.completed_count += 1
+            self.state.pending_text = new_text
 
     def clear_pending(self):
-        """Clear pending text without finalizing (e.g., segment was empty)."""
+        """Clear pending text without finalizing."""
         with self._lock:
-            if self.state.screen_text:
-                # Backspace to remove unfinalized text
-                self.backspace(len(self.state.screen_text))
-            self.state.screen_text = ""
-            self.state.target_text = ""
-            self.state.last_pending_end = -1.0
-            self.state.last_pending_no_speech_prob = 0.0
-            self.state.last_pending_avg_logprob = 0.0
+            if self.state.pending_text:
+                self.backspace(len(self.state.pending_text))
+                self.state.pending_text = ""
 
 
 class MicrophoneStream:
@@ -1000,159 +992,58 @@ class WhisperTyperClient:
         avg_logprob = float(segment.get("avg_logprob", 0))
         return no_speech_prob <= self.no_speech_thresh and avg_logprob >= self.min_avg_logprob
 
-    def _get_last_audio_end(self) -> float:
-        candidates = (
-            self.typer.state.last_pending_end,
-            self.typer.state.last_completed_end,
-            self.typer.state.last_finalized_end,
-        )
-        return max((c for c in candidates if c >= 0), default=-1.0)
-
-    def _is_duplicate_finalized(
-        self,
-        text: str,
-        pending_start: Optional[float],
-        pending_end: Optional[float],
-    ) -> bool:
-        if not text or not self.typer.state.last_finalized_text:
-            return False
-        if text != self.typer.state.last_finalized_text:
-            return False
-        if self.typer.state.last_finalized_end < 0:
-            return False
-        if pending_end is not None and pending_end <= self.typer.state.last_finalized_end + 1e-3:
-            return True
-        if pending_start is not None and pending_start <= self.typer.state.last_finalized_end + 1e-3:
-            return True
-        return False
-
     def _handle_transcription(self, data: dict):
-        """Process a transcription message from the server."""
+        """Process a transcription message from the server.
+
+        Simple protocol:
+        - finalize: text that is now final (type and never delete)
+        - text: current pending text (update via diff)
+        """
         logger.debug(f"Handling data: {data}")
-        if "segments" not in data:
-            logger.debug("No segments in data")
-            return
 
-        segments = data.get("segments", [])
-        if not segments:
-            logger.debug("Empty segments list")
-            return
+        # Handle finalized text first (if any)
+        if "finalize" in data:
+            finalized = data["finalize"]
 
-        completed_segments = [s for s in segments if s.get("completed", False)]
-        pending_segments = [s for s in segments if not s.get("completed", False)]
+            # Check for commands in finalized text
+            finalized_stripped = finalized.strip()
+            if finalized_stripped:
+                cmd_result = self.commands.process(finalized_stripped)
+                if cmd_result.action in ("keys", "literal"):
+                    if (
+                        not self.typer.state.last_command_text
+                        or self._normalize_cmd_text(finalized_stripped)
+                        != self._normalize_cmd_text(self.typer.state.last_command_text)
+                    ):
+                        self.typer.clear_pending()
+                        self._execute_command(cmd_result)
+                        self.typer.state.last_command_text = finalized_stripped
+                    return
 
-        latest_completed = completed_segments[-1] if completed_segments else None
-        completed_end = (
-            self._parse_segment_time(latest_completed.get("end"))
-            if latest_completed
-            else None
-        )
-        if completed_end is not None:
-            if completed_end + 1e-3 < self.typer.state.last_completed_end:
-                logger.debug(
-                    "Completed segment time reset: "
-                    f"{self.typer.state.last_completed_end:.3f} -> {completed_end:.3f}"
-                )
-                self.typer.state.last_completed_end = completed_end
-            elif completed_end > self.typer.state.last_completed_end + 1e-3:
-                if latest_completed and not self._segment_passes_filters(latest_completed):
-                    no_speech_prob = float(latest_completed.get("no_speech_prob", 0))
-                    avg_logprob = float(latest_completed.get("avg_logprob", 0))
-                    logger.info(
-                        "Skipping low-confidence completed segment: "
-                        f"no_speech_prob={no_speech_prob:.3f}, avg_logprob={avg_logprob:.3f}"
-                    )
-                    self.typer.clear_pending()
-                else:
-                    pending_text = (self.typer.state.target_text or self.typer.state.screen_text).strip()
-                    if pending_text:
-                        cmd_result = self.commands.process(pending_text)
-                        if cmd_result.action != "none":
-                            if (
-                                not self.typer.state.last_command_text
-                                or self._normalize_cmd_text(pending_text)
-                                != self._normalize_cmd_text(self.typer.state.last_command_text)
-                            ):
-                                self.typer.clear_pending()
-                                self._execute_command(cmd_result)
-                                self.typer.state.last_command_text = pending_text
-                            else:
-                                self.typer.clear_pending()
-                        else:
-                            self.typer.finalize_pending(final_end=completed_end)
-                self.typer.state.last_completed_end = completed_end
-                self.typer.state.last_command_text = ""
+            # Normal finalization
+            self.typer.handle_finalize(finalized)
 
-        # Handle the current in-progress segment
-        if pending_segments:
-            current = pending_segments[-1]
-            text = current.get("text", "").strip()
-            no_speech_prob = float(current.get("no_speech_prob", 0))
-            avg_logprob = float(current.get("avg_logprob", 0))
-            pending_start = self._parse_segment_time(current.get("start"))
-            pending_end = self._parse_segment_time(current.get("end"))
+        # Handle pending text update (if any)
+        if "text" in data:
+            pending = data["text"]
 
-            # Filter out likely hallucinations based on no_speech_prob
-            if no_speech_prob > self.no_speech_thresh:
-                logger.info(f"Filtering hallucination: {text!r} (no_speech_prob={no_speech_prob:.3f} > {self.no_speech_thresh})")
-                # Clear any stale pending state to prevent mismatch with server state
-                self.typer.clear_pending()
-                return
+            # Check for commands in pending text
+            pending_stripped = pending.strip()
+            if pending_stripped:
+                cmd_result = self.commands.process(pending_stripped)
+                if cmd_result.action in ("keys", "literal"):
+                    if (
+                        not self.typer.state.last_command_text
+                        or self._normalize_cmd_text(pending_stripped)
+                        != self._normalize_cmd_text(self.typer.state.last_command_text)
+                    ):
+                        self.typer.clear_pending()
+                        self._execute_command(cmd_result)
+                        self.typer.state.last_command_text = pending_stripped
+                    return
 
-            # Filter out low-confidence segments based on avg_logprob
-            if avg_logprob < self.min_avg_logprob:
-                logger.info(f"Filtering low-confidence: {text!r} (avg_logprob={avg_logprob:.3f} < {self.min_avg_logprob})")
-                # Clear any stale pending state to prevent mismatch with server state
-                self.typer.clear_pending()
-                return
-
-            utterance_id = int(current.get("utterance_id", 0))
-            logger.info(f"Segment: text={text!r}, utterance_id={utterance_id}, avg_logprob={avg_logprob:.2f}")
-
-            last_end = self._get_last_audio_end()
-            if pending_start is not None and last_end >= 0:
-                gap = pending_start - last_end
-                if gap > UTTERANCE_GAP_THRESHOLD:
-                    logger.info(f"New utterance detected: gap={gap:.2f}s")
-                    if self.typer.state.screen_text or self.typer.state.target_text:
-                        self.typer.finalize_pending()
-
-            self.typer.state.current_utterance_id = utterance_id
-            if pending_end is not None:
-                self.typer.state.last_pending_end = pending_end
-            else:
-                self.typer.state.last_pending_end = -1.0
-            self.typer.state.last_pending_no_speech_prob = no_speech_prob
-            self.typer.state.last_pending_avg_logprob = avg_logprob
-
-            # Skip if this text duplicates what we just finalized (prevents re-typing)
-            if self._is_duplicate_finalized(text, pending_start, pending_end):
-                logger.info(f"Skipping duplicate of finalized text: {text!r}")
-                return
-
-            # Skip if we already executed a command for this text
-            # (prevents re-execution as segment updates with same/similar content)
-            if (
-                self.typer.state.last_command_text
-                and self._normalize_cmd_text(text) == self._normalize_cmd_text(self.typer.state.last_command_text)
-            ):
-                logger.debug(f"Skipping already-executed command: {text!r}")
-                return
-
-            # Check if text is a command
-            cmd_result = self.commands.process(text)
-            if cmd_result.action in ("keys", "literal"):
-                # Execute commands immediately
-                # Clear any existing pending text first
-                if self.typer.state.screen_text:
-                    self.typer.clear_pending()
-                self._execute_command(cmd_result)
-                # Track that we executed this command to prevent re-execution
-                self.typer.state.last_command_text = text
-            else:
-                # Normal dictation - update pending
-                # Use payload (may be transformed, e.g., spelled letters)
-                self.typer.update_pending(cmd_result.payload)
+            # Normal pending update
+            self.typer.update_pending(pending)
 
     def _execute_command(self, cmd_result: CommandResult):
         """Execute a voice command."""
