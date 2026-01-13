@@ -1,0 +1,21 @@
+{
+    "title": "Whisper Typer",
+    "rules": [
+        {
+            "description": "Print Screen toggles Whisper Typer",
+            "manipulators": [
+                {
+                    "from": {
+                        "key_code": "print_screen"
+                    },
+                    "to": [
+                        {
+                            "shell_command": "$HOME/src/whisperlive-typer/scripts/toggle.sh"
+                        }
+                    ],
+                    "type": "basic"
+                }
+            ]
+        }
+    ]
+}

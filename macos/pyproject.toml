@@ -1,0 +1,11 @@
+[project]
+name = "whisper-server-macos"
+version = "0.1.0"
+description = "WhisperLive server for macOS using MLX"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "mlx",
+    "mlx-whisper",
+    "whisper-live",
+    "numpy<2",
+]

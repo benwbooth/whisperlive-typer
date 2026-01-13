@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whispertyper.client</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Adjust paths to match your installation -->
+        <string>/Users/YOUR_USERNAME/.local/bin/uv</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>/Users/YOUR_USERNAME/src/whisperlive-typer</string>
+        <string>python</string>
+        <string>/Users/YOUR_USERNAME/src/whisperlive-typer/whisper_typer.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/src/whisperlive-typer</string>
+
+    <!-- Don't start automatically at login -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Don't restart automatically if it exits -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Log output -->
+    <key>StandardOutPath</key>
+    <string>/tmp/whisper-typer.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/whisper-typer.log</string>
+</dict>
+</plist>

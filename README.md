@@ -15,19 +15,29 @@ Uses [WhisperLive](https://github.com/collabora/WhisperLive) server with AMD ROC
 ## Architecture
 
 ```
-Microphone → Client (whisper_typer.py) → WebSocket → Server (Docker/ROCm) → GPU
+Microphone → Client (whisper_typer.py) → WebSocket → Server → GPU
                       ↓
-                 ydotool → Keyboard Input → Any Application
+                 Keyboard Input → Any Application
 ```
+
+**Linux (AMD GPU):** Docker + ROCm + ydotool
+**macOS (Apple Silicon):** Native MLX + pynput (coming soon)
 
 ## Prerequisites
 
+### Linux
 - Docker or Podman with compose
 - AMD GPU with ROCm support (RX 6000/7000 series)
 - [Nix](https://nixos.org/) with flakes enabled
 - ydotool daemon running
 
+### macOS (Apple Silicon)
+- Python 3.10+
+- Apple Silicon Mac (M1/M2/M3/M4)
+
 ## Quick Start
+
+### Linux (AMD GPU)
 
 ```bash
 # Enter development shell
@@ -40,6 +50,39 @@ nix develop
 ./scripts/vad_calibrate.py --auto
 
 # Press Super+H to toggle speech-to-text!
+```
+
+### macOS (Apple Silicon)
+
+```bash
+# Run setup (installs uv, dependencies, configures launchctl service)
+./scripts/setup_macos.sh
+
+# Start the server manually (or it auto-starts at login)
+cd macos && uv run python ../run_server_macos.py
+
+# In another terminal, run the client (client port coming soon)
+# For now, you can test the server is working:
+curl -i http://localhost:9090
+# (Expected: "Upgrade Required" - server is running)
+```
+
+**macOS Server Environment Variables:**
+- `MLX_WHISPER_MODEL` - Model to use (default: `mlx-community/whisper-large-v3-turbo`)
+- `WHISPER_PORT` - Server port (default: `9090`)
+- `WHISPER_LANGUAGE` - Language code (default: `en`)
+
+**Manage the macOS service:**
+```bash
+# View logs
+tail -f /tmp/whispertyper-server.log
+
+# Stop/start service
+launchctl stop com.whispertyper.server
+launchctl start com.whispertyper.server
+
+# Unload completely
+launchctl unload ~/Library/LaunchAgents/com.whispertyper.server.plist
 ```
 
 ## Configuration

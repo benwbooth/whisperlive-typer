@@ -1,10 +1,12 @@
 #!/usr/bin/env -S uv run
 """
-WhisperLive client that types transcriptions using ydotool.
+WhisperLive client that types transcriptions.
 
 Connects to a WhisperLive server, streams microphone audio,
 and types the transcribed text in real-time with backspace
 corrections when the transcription is updated.
+
+Supports Linux (ydotool) and macOS (pynput).
 """
 
 import argparse
@@ -28,6 +30,9 @@ import numpy as np
 import sounddevice as sd
 import websockets
 import yaml
+
+from typing_platform import get_notifier, get_typer, ensure_permissions
+from typing_platform.base import Typer
 
 # Try to import grapheme for proper Unicode grapheme cluster counting
 # Falls back to len() if not available (pip install grapheme)
@@ -67,45 +72,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Keyboard scan codes for ydotool
-# Reference: Linux input-event-codes.h
-KEY_CODES = {
+# Valid key names (platform-agnostic, for command validation)
+VALID_KEYS = {
     # Special keys
-    "escape": 1, "esc": 1,
-    "backspace": 14, "back": 14,
-    "tab": 15,
-    "enter": 28, "return": 28,
-    "space": 57,
-    "delete": 111, "del": 111,
+    "escape", "esc", "backspace", "back", "tab", "enter", "return", "space",
+    "delete", "del",
     # Modifiers
-    "ctrl": 29, "control": 29, "leftctrl": 29,
-    "shift": 42, "leftshift": 42,
-    "alt": 56, "leftalt": 56,
-    "super": 125, "meta": 125, "windows": 125, "win": 125,
-    "rightctrl": 97, "rightshift": 54, "rightalt": 100,
+    "ctrl", "control", "shift", "alt", "option", "super", "meta", "command",
+    "cmd", "windows", "win",
     # Navigation
-    "home": 102, "end": 107,
-    "pageup": 104, "pgup": 104,
-    "pagedown": 109, "pgdn": 109,
-    "up": 103, "down": 108, "left": 105, "right": 106,
-    "insert": 110, "ins": 110,
+    "home", "end", "pageup", "pgup", "pagedown", "pgdn",
+    "up", "down", "left", "right", "insert", "ins",
     # Function keys
-    "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64,
-    "f7": 65, "f8": 66, "f9": 67, "f10": 68, "f11": 87, "f12": 88,
-    # Numbers (top row)
-    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
-    "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    # Numbers
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
     # Letters
-    "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
-    "h": 35, "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49,
-    "o": 24, "p": 25, "q": 16, "r": 19, "s": 31, "t": 20, "u": 22,
-    "v": 47, "w": 17, "x": 45, "y": 21, "z": 44,
-    # Punctuation
-    "minus": 12, "equal": 13, "equals": 13,
-    "leftbracket": 26, "rightbracket": 27,
-    "semicolon": 39, "apostrophe": 40, "quote": 40,
-    "grave": 41, "backslash": 43,
-    "comma": 51, "period": 52, "dot": 52, "slash": 53,
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
 }
 
 # Modifier keys that indicate a key combo
@@ -202,7 +186,11 @@ class CommandResult:
     payload: str  # key sequence, literal text, or original text
 
 
-CONFIG_PATH = Path.home() / ".config" / "whisper-typer" / "config.yaml"
+# Platform-appropriate config location
+if sys.platform == "darwin":
+    CONFIG_PATH = Path.home() / "Library" / "Application Support" / "whisper-typer" / "config.yaml"
+else:
+    CONFIG_PATH = Path.home() / ".config" / "whisper-typer" / "config.yaml"
 
 
 @dataclass
@@ -218,6 +206,8 @@ class Config:
     no_speech_thresh: float = 0.45  # Segments with no_speech_prob above this are filtered (hallucinations)
     min_avg_logprob: float = -0.8  # Segments with avg_logprob below this are filtered (low confidence)
     pending_debounce_ms: int = 200  # Debounce pending updates to avoid excessive retyping
+    ydotool_key_delay_ms: int = 2  # Linux ydotool: delay between key presses (ms)
+    ydotool_key_hold_ms: int = 1   # Linux ydotool: key hold duration (ms)
     commands: dict = None
 
     def __post_init__(self):
@@ -259,6 +249,8 @@ class Config:
                 # Typer settings
                 typer = data.get("typer", {})
                 config.pending_debounce_ms = typer.get("pending_debounce_ms", config.pending_debounce_ms)
+                config.ydotool_key_delay_ms = typer.get("ydotool_key_delay_ms", config.ydotool_key_delay_ms)
+                config.ydotool_key_hold_ms = typer.get("ydotool_key_hold_ms", config.ydotool_key_hold_ms)
 
                 # Commands
                 commands_data = data.get("commands", {})
@@ -348,7 +340,7 @@ class CommandProcessor:
         # 5. "press X" prefix for action keys (e.g., "press enter", "press tab")
         if text_lower.startswith("press "):
             key_name = text_lower[6:].strip()
-            if key_name in ACTION_KEYS or key_name in KEY_CODES:
+            if key_name in ACTION_KEYS or key_name in VALID_KEYS:
                 return CommandResult("keys", self._normalize_keys(key_name))
 
         # 6. Action keys (enter, backspace, tab, etc.)
@@ -425,70 +417,6 @@ class CommandProcessor:
         return ''.join(result)
 
 
-NOTIFICATION_ID_FILE = Path.home() / ".cache/whisper-typer/notification_id"
-
-
-def close_notification_by_id(notification_id: int):
-    """Close a notification by its ID."""
-    try:
-        subprocess.run([
-            'gdbus', 'call', '--session',
-            '--dest', 'org.freedesktop.Notifications',
-            '--object-path', '/org/freedesktop/Notifications',
-            '--method', 'org.freedesktop.Notifications.CloseNotification',
-            str(notification_id)
-        ], capture_output=True, timeout=5)
-    except Exception:
-        pass
-
-
-def cleanup_notification():
-    """atexit handler to close notification from saved ID."""
-    try:
-        if NOTIFICATION_ID_FILE.exists():
-            notification_id = int(NOTIFICATION_ID_FILE.read_text().strip())
-            close_notification_by_id(notification_id)
-            NOTIFICATION_ID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-atexit.register(cleanup_notification)
-
-
-class Notifier:
-    """Desktop notification that can be shown and closed."""
-
-    def __init__(self):
-        self.notification_id = None
-
-    def show(self, message: str, persistent: bool = False):
-        """Show notification. If persistent, stays until closed."""
-        try:
-            cmd = ['notify-send', '--app-name=Whisper Typer', '--print-id']
-            if persistent:
-                cmd.extend(['--expire-time=0'])  # Never auto-close
-            if self.notification_id:
-                cmd.extend(['--replace-id', str(self.notification_id)])
-            cmd.append(message)
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.stdout.strip():
-                self.notification_id = int(result.stdout.strip())
-                # Save to file for cleanup if process is killed
-                NOTIFICATION_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
-                NOTIFICATION_ID_FILE.write_text(str(self.notification_id))
-        except (FileNotFoundError, ValueError):
-            pass
-
-    def close(self):
-        """Close the current notification."""
-        if self.notification_id:
-            close_notification_by_id(self.notification_id)
-            self.notification_id = None
-        # Clean up the saved ID file
-        NOTIFICATION_ID_FILE.unlink(missing_ok=True)
-
-
 @dataclass
 class TyperState:
     """Tracks what has been typed to enable corrections.
@@ -502,112 +430,29 @@ class TyperState:
     last_command_text: str = ""  # Last command text we executed (to prevent re-execution)
 
 
-class YdotoolTyper:
-    """Handles typing via ydotool with backspace correction support."""
+class StatefulTyper:
+    """
+    Wraps a platform Typer with state management for corrections.
 
-    def __init__(self, socket_path: Optional[str] = None, dry_run: bool = False):
-        self.socket_path = socket_path or os.environ.get(
-            'YDOTOOL_SOCKET',
-            '/run/ydotoold/socket'
-        )
-        self.dry_run = dry_run
+    Handles finalized vs pending text, backspace corrections, etc.
+    """
+
+    def __init__(self, typer: Typer):
+        self._typer = typer
         self.state = TyperState()
         self._lock = threading.Lock()
 
-    def _run_ydotool(self, *args):
-        """Execute ydotool command."""
-        env = os.environ.copy()
-        env['YDOTOOL_SOCKET'] = self.socket_path
-
-        cmd = ['ydotool'] + list(args)
-
-        if self.dry_run:
-            logger.info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
-            return
-
-        try:
-            subprocess.run(cmd, env=env, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"ydotool error: {e.stderr.decode()}")
-        except FileNotFoundError:
-            logger.error("ydotool not found. Is it installed?")
-
     def type_text(self, text: str):
-        """Type text using ydotool."""
-        if not text:
-            return
-        logger.info(f"Typing: {text!r}")
-        # ydotool type command with minimal delays for speed
-        self._run_ydotool('type', '--key-delay=5', '--key-hold=2', '--clearmodifiers', '--', text)
+        """Type text."""
+        self._typer.type_text(text)
 
     def backspace(self, count: int):
         """Send backspace key presses."""
-        if count <= 0:
-            return
-        # Key code 14 is backspace - send all at once for speed
-        # Format: keycode:1 (down) keycode:0 (up)
-        keys = ' '.join(['14:1', '14:0'] * count)
-        self._run_ydotool('key', '--key-delay=5', *keys.split())
+        self._typer.backspace(count)
 
     def send_keys(self, keys_str: str):
-        """
-        Send a key combination.
-
-        Args:
-            keys_str: Key combo like "ctrl+c", "ctrl+shift+t", "enter", "enter enter"
-        """
-        # Handle multiple key sequences separated by space (e.g., "enter enter")
-        sequences = keys_str.strip().split()
-        if not sequences:
-            return
-
-        # Group into combos (consecutive keys with + are one combo)
-        combos = []
-        current_combo = []
-        for seq in sequences:
-            if '+' in seq:
-                # This is a combo like ctrl+c
-                if current_combo:
-                    combos.extend(current_combo)
-                    current_combo = []
-                combos.append(seq)
-            else:
-                # Single key, might be part of "enter enter" sequence
-                combos.append(seq)
-
-        for combo in combos:
-            self._send_key_combo(combo)
-
-    def _send_key_combo(self, combo: str):
-        """Send a single key combination like 'ctrl+c' or 'enter'."""
-        # Strip punctuation that Whisper might add
-        combo = combo.lower().rstrip('.,!?')
-        parts = combo.split('+')
-        codes = []
-
-        for part in parts:
-            part = part.strip().rstrip('.,!?')
-            if part in KEY_CODES:
-                codes.append(KEY_CODES[part])
-            else:
-                logger.warning(f"Unknown key: {part}")
-                return
-
-        if not codes:
-            return
-
-        logger.info(f"Sending keys: {combo}")
-
-        # Build key sequence: press all modifiers, press key, release all in reverse
-        key_args = []
-        # Press all keys down
-        for code in codes:
-            key_args.append(f"{code}:1")
-        # Release all keys up (reverse order)
-        for code in reversed(codes):
-            key_args.append(f"{code}:0")
-
-        self._run_ydotool('key', '--key-delay=5', *key_args)
+        """Send key combination."""
+        self._typer.send_keys(keys_str)
 
     def handle_finalize(self, text: str):
         """
@@ -880,7 +725,7 @@ class WhisperTyperClient:
     def __init__(
         self,
         config: Config,
-        typer: Optional[YdotoolTyper] = None,
+        typer: Optional[StatefulTyper] = None,
         dry_run: bool = False,
         device_index: Optional[int] = None,
     ):
@@ -893,9 +738,9 @@ class WhisperTyperClient:
         self.vad_offset = config.vad_offset
         self.no_speech_thresh = config.no_speech_thresh
         self.min_avg_logprob = config.min_avg_logprob
-        self.typer = typer or YdotoolTyper(dry_run=dry_run)
+        self.typer = typer or StatefulTyper(get_typer(dry_run=dry_run))
         self.mic = MicrophoneStream(device_index=device_index)
-        self.notifier = Notifier()
+        self.notifier = get_notifier()
         self.commands = CommandProcessor(config.commands)
         self._running = False
         self._websocket = None
@@ -1262,7 +1107,23 @@ CLI arguments override config file settings.
         if device_index is None:
             sys.exit(1)
 
-    typer = YdotoolTyper(socket_path=args.socket, dry_run=args.dry_run)
+    # Check platform permissions (e.g., accessibility on macOS)
+    ensure_permissions()
+
+    # Test notification system
+    if sys.platform == "darwin":
+        test_notifier = get_notifier()
+        test_notifier.show("Whisper Typer starting...")
+        logger.info("Notification test sent. If you didn't see it, install terminal-notifier: brew install terminal-notifier")
+
+    # Create platform-appropriate typer with state management
+    typer_kwargs = {"dry_run": args.dry_run}
+    if sys.platform == "linux":
+        if args.socket:
+            typer_kwargs["socket_path"] = args.socket
+        typer_kwargs["key_delay"] = config.ydotool_key_delay_ms
+        typer_kwargs["key_hold"] = config.ydotool_key_hold_ms
+    typer = StatefulTyper(get_typer(**typer_kwargs))
 
     client = WhisperTyperClient(
         config=config,
