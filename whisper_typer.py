@@ -29,6 +29,38 @@ import sounddevice as sd
 import websockets
 import yaml
 
+# Try to import grapheme for proper Unicode grapheme cluster counting
+# Falls back to len() if not available (pip install grapheme)
+try:
+    import grapheme
+    def grapheme_len(s: str) -> int:
+        """Count grapheme clusters (user-perceived characters) in a string."""
+        return grapheme.length(s)
+
+    def grapheme_slice(s: str, start: int, end: int = None) -> str:
+        """Slice string by grapheme clusters."""
+        if end is None:
+            return "".join(grapheme.graphemes(s)[start:])
+        return "".join(list(grapheme.graphemes(s))[start:end])
+
+    def grapheme_iter(s: str):
+        """Iterate over grapheme clusters in a string."""
+        return grapheme.graphemes(s)
+except ImportError:
+    def grapheme_len(s: str) -> int:
+        """Fallback: count codepoints (may be wrong for complex emoji/combining chars)."""
+        return len(s)
+
+    def grapheme_slice(s: str, start: int, end: int = None) -> str:
+        """Fallback: slice by codepoints."""
+        if end is None:
+            return s[start:]
+        return s[start:end]
+
+    def grapheme_iter(s: str):
+        """Fallback: iterate over codepoints."""
+        return iter(s)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -185,6 +217,7 @@ class Config:
     vad_offset: float = 0.2
     no_speech_thresh: float = 0.45  # Segments with no_speech_prob above this are filtered (hallucinations)
     min_avg_logprob: float = -0.8  # Segments with avg_logprob below this are filtered (low confidence)
+    pending_debounce_ms: int = 200  # Debounce pending updates to avoid excessive retyping
     commands: dict = None
 
     def __post_init__(self):
@@ -222,6 +255,10 @@ class Config:
                 config.vad_offset = vad.get("offset", config.vad_offset)
                 config.no_speech_thresh = vad.get("no_speech_thresh", config.no_speech_thresh)
                 config.min_avg_logprob = vad.get("min_avg_logprob", config.min_avg_logprob)
+
+                # Typer settings
+                typer = data.get("typer", {})
+                config.pending_debounce_ms = typer.get("pending_debounce_ms", config.pending_debounce_ms)
 
                 # Commands
                 commands_data = data.get("commands", {})
@@ -585,44 +622,44 @@ class YdotoolTyper:
             if not text:
                 # Nothing to finalize, just clear pending
                 if pending:
-                    self.backspace(len(pending))
+                    self.backspace(grapheme_len(pending))
                     self.state.pending_text = ""
                 return
 
             # Optimize: if finalized text starts with pending, just type the rest
             if pending and text.startswith(pending):
                 # Pending is already on screen, just add the remainder
-                remainder = text[len(pending):]
+                remainder = text[len(pending):]  # Safe: pending is exact prefix
                 if remainder:
                     logger.info(f"Finalizing (appending): {remainder!r}")
                     self.type_text(remainder)
                 else:
                     logger.info(f"Finalizing (already typed): {text!r}")
                 self.state.pending_text = ""
-                self.state.finalized_length += len(text)
+                self.state.finalized_length += grapheme_len(text)
                 return
 
             # Optimize: if pending starts with finalized, backspace the extra
             if pending and pending.startswith(text):
-                extra = len(pending) - len(text)
+                extra = grapheme_len(pending) - grapheme_len(text)
                 if extra > 0:
-                    logger.info(f"Finalizing (trimming {extra} chars): {text!r}")
+                    logger.info(f"Finalizing (trimming {extra} graphemes): {text!r}")
                     self.backspace(extra)
                 else:
                     logger.info(f"Finalizing (exact match): {text!r}")
                 self.state.pending_text = ""
-                self.state.finalized_length += len(text)
+                self.state.finalized_length += grapheme_len(text)
                 return
 
             # General case: clear pending and type finalized
             if pending:
                 logger.info(f"Clearing pending before finalize: {pending!r}")
-                self.backspace(len(pending))
+                self.backspace(grapheme_len(pending))
                 self.state.pending_text = ""
 
             logger.info(f"Finalizing: {text!r}")
             self.type_text(text)
-            self.state.finalized_length += len(text)
+            self.state.finalized_length += grapheme_len(text)
 
     def update_pending(self, new_text: str):
         """
@@ -649,23 +686,25 @@ class YdotoolTyper:
 
             if not new_text:
                 # Clear pending
-                self.backspace(len(old))
+                self.backspace(grapheme_len(old))
                 self.state.pending_text = ""
                 return
 
-            # Find common prefix
+            # Find common prefix (grapheme-aware)
+            old_graphemes = list(grapheme_iter(old))
+            new_graphemes = list(grapheme_iter(new_text))
             common_len = 0
-            min_len = min(len(old), len(new_text))
+            min_len = min(len(old_graphemes), len(new_graphemes))
             for i in range(min_len):
-                if old[i] == new_text[i]:
+                if old_graphemes[i] == new_graphemes[i]:
                     common_len = i + 1
                 else:
                     break
 
-            to_delete = len(old) - common_len
-            to_add = new_text[common_len:]
+            to_delete = len(old_graphemes) - common_len
+            to_add = "".join(new_graphemes[common_len:])
 
-            logger.info(f"Pending diff: common={common_len}, delete={to_delete}, add={len(to_add)}")
+            logger.info(f"Pending diff: common={common_len}, delete={to_delete}, add={grapheme_len(to_add)}")
 
             if to_delete > 0:
                 self.backspace(to_delete)
@@ -679,7 +718,7 @@ class YdotoolTyper:
         """Clear pending text without finalizing."""
         with self._lock:
             if self.state.pending_text:
-                self.backspace(len(self.state.pending_text))
+                self.backspace(grapheme_len(self.state.pending_text))
                 self.state.pending_text = ""
 
 
@@ -860,6 +899,11 @@ class WhisperTyperClient:
         self.commands = CommandProcessor(config.commands)
         self._running = False
         self._websocket = None
+        # Debounce for pending updates (avoid retyping every intermediate update)
+        self._pending_debounce_ms = config.pending_debounce_ms
+        self._debounce_timer: Optional[threading.Timer] = None
+        self._debounced_pending: Optional[str] = None
+        self._debounce_lock = threading.Lock()
 
     async def connect(self):
         """Connect to the WhisperLive server."""
@@ -1003,6 +1047,9 @@ class WhisperTyperClient:
 
         # Handle finalized text first (if any)
         if "finalize" in data:
+            # Flush any debounced pending before finalizing
+            self._flush_debounced_pending()
+
             finalized = data["finalize"]
 
             # Check for commands in finalized text
@@ -1042,8 +1089,50 @@ class WhisperTyperClient:
                         self.typer.state.last_command_text = pending_stripped
                     return
 
-            # Normal pending update
-            self.typer.update_pending(pending)
+            # Normal pending update (debounced)
+            self._schedule_pending_update(pending)
+
+    def _flush_debounced_pending(self):
+        """Immediately apply any debounced pending update."""
+        with self._debounce_lock:
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+            if self._debounced_pending is not None:
+                pending = self._debounced_pending
+                self._debounced_pending = None
+                self.typer.update_pending(pending)
+
+    def _schedule_pending_update(self, pending: str):
+        """Schedule a debounced pending update."""
+        with self._debounce_lock:
+            # Cancel existing timer
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+
+            # Store the latest pending text
+            self._debounced_pending = pending
+
+            # If debounce is disabled (0), apply immediately
+            if self._pending_debounce_ms <= 0:
+                self._debounced_pending = None
+                self.typer.update_pending(pending)
+                return
+
+            # Schedule delayed update
+            def apply_pending():
+                with self._debounce_lock:
+                    if self._debounced_pending is not None:
+                        p = self._debounced_pending
+                        self._debounced_pending = None
+                        self._debounce_timer = None
+                        self.typer.update_pending(p)
+
+            self._debounce_timer = threading.Timer(
+                self._pending_debounce_ms / 1000.0,
+                apply_pending
+            )
+            self._debounce_timer.start()
 
     def _execute_command(self, cmd_result: CommandResult):
         """Execute a voice command."""
