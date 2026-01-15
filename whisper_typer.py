@@ -75,13 +75,24 @@ logger = logging.getLogger(__name__)
 
 
 # Server management functions
-def is_server_running(host: str, port: int, timeout: float = 2.0) -> bool:
-    """Check if the WhisperLive server is accepting connections."""
-    import socket
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
+def is_server_running(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Check if the WhisperLive server is accepting websocket connections."""
+    import asyncio
+
+    async def try_connect():
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(f"ws://{host}:{port}"),
+                timeout=timeout
+            )
+            await ws.close()
             return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
+        except Exception:
+            return False
+
+    try:
+        return asyncio.run(try_connect())
+    except Exception:
         return False
 
 
