@@ -17,6 +17,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -71,6 +72,200 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# Server management functions
+def is_server_running(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Check if the WhisperLive server is accepting connections."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
+def start_server(server_dir: Optional[str] = None) -> bool:
+    """Start the WhisperLive server.
+
+    On Linux: Uses docker compose
+    On macOS: Uses launchctl to start the MLX server
+
+    Args:
+        server_dir: Directory containing server files.
+                   If None/empty, uses the script's directory.
+
+    Returns:
+        True if server started successfully, False otherwise.
+    """
+    if not server_dir:
+        server_dir = str(Path(__file__).parent)
+
+    if sys.platform == "darwin":
+        return _start_server_macos(server_dir)
+    else:
+        return _start_server_docker(server_dir)
+
+
+def _start_server_docker(server_dir: str) -> bool:
+    """Start server via docker compose (Linux)."""
+    compose_file = Path(server_dir) / "docker-compose.yml"
+    if not compose_file.exists():
+        logger.error(f"docker-compose.yml not found in {server_dir}")
+        return False
+
+    logger.info(f"Starting server from {server_dir}...")
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "up", "-d"],
+            cwd=server_dir,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to start server: {result.stderr}")
+            return False
+        logger.info("Docker compose started")
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout starting docker compose")
+        return False
+    except FileNotFoundError:
+        logger.error("docker command not found - is Docker installed?")
+        return False
+
+
+LAUNCHD_LABEL = "com.whispertyper.server"
+
+
+def _install_launchd_plist(server_dir: str) -> bool:
+    """Install the launchd plist to ~/Library/LaunchAgents/ with correct paths."""
+    source_plist = Path(server_dir) / "macos" / "com.whispertyper.server.plist"
+    if not source_plist.exists():
+        logger.error(f"Plist template not found: {source_plist}")
+        return False
+
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    dest_plist = launch_agents_dir / "com.whispertyper.server.plist"
+
+    # Read template and substitute paths
+    content = source_plist.read_text()
+    username = os.environ.get("USER", "")
+
+    # Find uv path
+    uv_path = shutil.which("uv") or f"/Users/{username}/.local/bin/uv"
+
+    content = content.replace("/Users/YOUR_USERNAME", str(Path.home()))
+    content = content.replace(f"/Users/{username}/.local/bin/uv", uv_path)
+
+    # Update working directory and script paths to actual server_dir
+    content = content.replace("/Users/" + username + "/src/whisperlive-typer", server_dir)
+
+    dest_plist.write_text(content)
+    logger.info(f"Installed launchd plist to {dest_plist}")
+    return True
+
+
+def _start_server_macos(server_dir: str) -> bool:
+    """Start server via launchctl (macOS with MLX)."""
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    plist_path = launch_agents_dir / "com.whispertyper.server.plist"
+
+    # Install plist if not present
+    if not plist_path.exists():
+        logger.info("Installing launchd plist...")
+        if not _install_launchd_plist(server_dir):
+            return False
+
+    # Check if already loaded
+    result = subprocess.run(
+        ["launchctl", "list", LAUNCHD_LABEL],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        # Not loaded, load it first
+        logger.info("Loading launchd service...")
+        result = subprocess.run(
+            ["launchctl", "load", str(plist_path)],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to load launchd service: {result.stderr}")
+            return False
+
+    # Start the service
+    logger.info("Starting MLX server via launchctl...")
+    result = subprocess.run(
+        ["launchctl", "start", LAUNCHD_LABEL],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        logger.error(f"Failed to start server: {result.stderr}")
+        return False
+
+    logger.info("MLX server started via launchctl")
+    return True
+
+
+def wait_for_server(host: str, port: int, timeout: int = 120, poll_interval: float = 2.0) -> bool:
+    """Wait for the server to become ready.
+
+    Args:
+        host: Server host
+        port: Server port
+        timeout: Maximum seconds to wait
+        poll_interval: Seconds between connection attempts
+
+    Returns:
+        True if server became ready, False if timeout exceeded.
+    """
+    import time
+    start = time.time()
+    while time.time() - start < timeout:
+        if is_server_running(host, port, timeout=1.0):
+            logger.info("Server is ready")
+            return True
+        remaining = int(timeout - (time.time() - start))
+        logger.info(f"Waiting for server... ({remaining}s remaining)")
+        time.sleep(poll_interval)
+
+    logger.error(f"Server did not start within {timeout} seconds")
+    return False
+
+
+def ensure_server_running(host: str, port: int, auto_start: bool, server_dir: str, timeout: int) -> bool:
+    """Ensure the server is running, starting it if necessary.
+
+    Args:
+        host: Server host
+        port: Server port
+        auto_start: Whether to auto-start the server if not running
+        server_dir: Directory containing docker-compose.yml
+        timeout: Seconds to wait for server to start
+
+    Returns:
+        True if server is running, False otherwise.
+    """
+    if is_server_running(host, port):
+        logger.info(f"Server already running at {host}:{port}")
+        return True
+
+    if not auto_start:
+        logger.error(f"Server not running at {host}:{port} and auto_start is disabled")
+        return False
+
+    logger.info(f"Server not running at {host}:{port}, starting...")
+    if not start_server(server_dir):
+        return False
+
+    return wait_for_server(host, port, timeout)
+
 
 # Valid key names (platform-agnostic, for command validation)
 VALID_KEYS = {
@@ -208,6 +403,10 @@ class Config:
     pending_debounce_ms: int = 200  # Debounce pending updates to avoid excessive retyping
     ydotool_key_delay_ms: int = 2  # Linux ydotool: delay between key presses (ms)
     ydotool_key_hold_ms: int = 1   # Linux ydotool: key hold duration (ms)
+    # Server auto-start settings
+    auto_start_server: bool = True  # Start server automatically if not running
+    server_dir: str = ""  # Directory containing docker-compose.yml (empty = script directory)
+    server_start_timeout: int = 120  # Seconds to wait for server to start
     commands: dict = None
 
     def __post_init__(self):
@@ -229,6 +428,9 @@ class Config:
                 server = data.get("server", {})
                 config.host = server.get("host", config.host)
                 config.port = server.get("port", config.port)
+                config.auto_start_server = server.get("auto_start", config.auto_start_server)
+                config.server_dir = server.get("dir", config.server_dir)
+                config.server_start_timeout = server.get("start_timeout", config.server_start_timeout)
 
                 # Whisper settings
                 whisper = data.get("whisper", {})
@@ -1064,6 +1266,16 @@ CLI arguments override config file settings.
         default=None,
         help="VAD offset threshold (0.0-1.0). Lower = longer speech segments."
     )
+    parser.add_argument(
+        "--no-auto-start",
+        action="store_true",
+        help="Don't auto-start the server if not running"
+    )
+    parser.add_argument(
+        "--server-dir",
+        default=None,
+        help="Directory containing docker-compose.yml for server auto-start"
+    )
 
     args = parser.parse_args()
 
@@ -1098,6 +1310,23 @@ CLI arguments override config file settings.
         config.vad_onset = args.vad_onset
     if args.vad_offset is not None:
         config.vad_offset = args.vad_offset
+    if args.no_auto_start:
+        config.auto_start_server = False
+    if args.server_dir is not None:
+        config.server_dir = args.server_dir
+
+    # Ensure server is running (auto-start if configured)
+    if not ensure_server_running(
+        config.host,
+        config.port,
+        config.auto_start_server,
+        config.server_dir,
+        config.server_start_timeout
+    ):
+        print("Error: Server is not running and could not be started.")
+        print(f"Make sure the WhisperLive server is running at {config.host}:{config.port}")
+        print("Or use --no-auto-start to disable auto-start and see the full error.")
+        sys.exit(1)
 
     # Resolve device - CLI arg or config
     device_str = args.device if args.device is not None else config.device
