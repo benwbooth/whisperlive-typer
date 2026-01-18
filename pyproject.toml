@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "whisper-typer"
 version = "0.1.0"
@@ -13,3 +17,9 @@ dependencies = [
     "grapheme",
     "pynput; sys_platform == 'darwin'",
 ]
+
+[project.scripts]
+whisper-typer = "whisper_typer:main"
+
+[tool.setuptools]
+py-modules = ["whisper_typer"]
