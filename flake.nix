@@ -262,8 +262,8 @@ EOF
           '';
         };
 
-        # Frontend: whisper-typer client
-        whisper-typer = python.pkgs.buildPythonApplication {
+        # Frontend: whisper-typer client (base package)
+        whisper-typer-base = python.pkgs.buildPythonApplication {
           pname = "whisper-typer";
           version = "0.1.0";
           format = "pyproject";
@@ -298,6 +298,26 @@ EOF
             platforms = platforms.linux;
             mainProgram = "whisper-typer";
           };
+        };
+
+        # Toggle script for the client user service
+        whisper-toggle = pkgs.writeShellScriptBin "whisper-toggle" ''
+          SERVICE="whisper-typer.service"
+
+          if systemctl --user is-active --quiet "$SERVICE"; then
+            echo "Stopping $SERVICE..."
+            systemctl --user stop "$SERVICE"
+          else
+            echo "Starting $SERVICE..."
+            systemctl --user start "$SERVICE"
+          fi
+        '';
+
+        # Combined package with client and toggle script
+        whisper-typer = pkgs.symlinkJoin {
+          name = "whisper-typer";
+          paths = [ whisper-typer-base whisper-toggle ];
+          meta = whisper-typer-base.meta;
         };
 
       in
@@ -398,6 +418,24 @@ EOF
                 Restart = "on-failure";
                 # GPU access
                 SupplementaryGroups = [ "video" "render" ];
+              };
+            };
+
+            # User service for the client (toggle with whisper-toggle)
+            systemd.user.services.whisper-typer = mkIf cfg.client.enable {
+              description = "WhisperLive Typer Client";
+              after = [ "graphical-session.target" "pipewire.service" ];
+              requisite = [ "graphical-session.target" ];
+
+              environment = {
+                YDOTOOL_SOCKET = "/run/ydotoold/socket";
+              };
+
+              serviceConfig = {
+                Type = "simple";
+                ExecStart = "${self.packages.${pkgs.system}.whisper-typer}/bin/whisper-typer";
+                Restart = "on-failure";
+                RestartSec = 3;
               };
             };
           };
