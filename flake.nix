@@ -242,10 +242,23 @@ EOF
           text = ''
             export HSA_OVERRIDE_GFX_VERSION=11.0.0
             export HIP_VISIBLE_DEVICES=0
-            python -m whisper_live.server \
-              --port "''${WHISPER_PORT:-9090}" \
-              --backend faster_whisper \
-              "$@"
+            python << EOF
+import os
+from whisper_live.server import TranscriptionServer
+
+port = int(os.environ.get("WHISPER_PORT", "9090"))
+backend = os.environ.get("WHISPER_BACKEND", "faster_whisper")
+model = os.environ.get("WHISPER_MODEL", None)
+
+print(f"Starting WhisperLive server on port {port} with backend {backend}")
+server = TranscriptionServer()
+server.run(
+    "0.0.0.0",
+    port=port,
+    backend=backend,
+    faster_whisper_custom_model_path=model,
+)
+EOF
           '';
         };
 
