@@ -52,6 +52,60 @@ nix develop
 # Press Super+H to toggle speech-to-text!
 ```
 
+### NixOS (Native Packages)
+
+For NixOS users, add this to your `/etc/nixos/flake.nix`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    whisperlive-typer.url = "github:benwbooth/whisperlive-typer";
+    # ... other inputs
+  };
+
+  outputs = { self, nixpkgs, whisperlive-typer, ... }: {
+    nixosConfigurations.your-hostname = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        whisperlive-typer.nixosModules.default
+      ];
+    };
+  };
+}
+```
+
+Then enable in `configuration.nix`:
+
+```nix
+{
+  services.whisper-typer = {
+    enable = true;
+    server = {
+      enable = true;
+      port = 9090;
+      gpuArch = "gfx1100";  # RX 7900 XTX
+    };
+    client.enable = true;
+  };
+}
+```
+
+Rebuild and use:
+
+```bash
+sudo nixos-rebuild switch
+
+# Toggle speech-to-text on/off
+whisper-toggle
+
+# Or manage the user service directly
+systemctl --user start whisper-typer
+systemctl --user stop whisper-typer
+systemctl --user status whisper-typer
+```
+
 ### macOS (Apple Silicon)
 
 ```bash
