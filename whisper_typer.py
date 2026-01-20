@@ -412,8 +412,8 @@ class Config:
     no_speech_thresh: float = 0.45  # Segments with no_speech_prob above this are filtered (hallucinations)
     min_avg_logprob: float = -0.8  # Segments with avg_logprob below this are filtered (low confidence)
     pending_debounce_ms: int = 200  # Debounce pending updates to avoid excessive retyping
-    ydotool_key_delay_ms: int = 2  # Linux ydotool: delay between key presses (ms)
-    ydotool_key_hold_ms: int = 1   # Linux ydotool: key hold duration (ms)
+    ydotool_key_delay_ms: int = 4  # Linux ydotool: delay between key presses (ms)
+    ydotool_key_hold_ms: int = 2   # Linux ydotool: key hold duration (ms)
     # Server auto-start settings
     auto_start_server: bool = True  # Start server automatically if not running
     server_dir: str = ""  # Directory containing docker-compose.yml (empty = script directory)
@@ -695,6 +695,9 @@ class StatefulTyper:
                     logger.info(f"Finalizing (already typed): {text!r}")
                 self.state.pending_text = ""
                 self.state.finalized_length += grapheme_len(text)
+                # Add space after finalization
+                self.type_text(" ")
+                self.state.finalized_length += 1
                 return
 
             # Optimize: if pending starts with finalized, backspace the extra
@@ -707,6 +710,9 @@ class StatefulTyper:
                     logger.info(f"Finalizing (exact match): {text!r}")
                 self.state.pending_text = ""
                 self.state.finalized_length += grapheme_len(text)
+                # Add space after finalization
+                self.type_text(" ")
+                self.state.finalized_length += 1
                 return
 
             # General case: clear pending and type finalized
@@ -718,6 +724,9 @@ class StatefulTyper:
             logger.info(f"Finalizing: {text!r}")
             self.type_text(text)
             self.state.finalized_length += grapheme_len(text)
+            # Add space after finalization
+            self.type_text(" ")
+            self.state.finalized_length += 1
 
     def update_pending(self, new_text: str):
         """
