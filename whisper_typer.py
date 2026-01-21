@@ -807,6 +807,10 @@ class MicrophoneStream:
         self._running = False
         self._queue: queue.Queue = queue.Queue()
         self._device_sample_rate: Optional[int] = None
+        # Mute detection state
+        self._mute_cache: Optional[bool] = None
+        self._mute_cache_time: float = 0
+        self._mute_cache_ttl: float = 0.5  # Check mute status every 500ms
 
     @classmethod
     def list_devices(cls) -> list[dict]:
@@ -872,6 +876,38 @@ class MicrophoneStream:
         target_indices = np.linspace(0, len(audio) - 1, target_length)
         return np.interp(target_indices, orig_indices, audio.flatten()).astype(np.float32)
 
+    def is_muted(self) -> bool:
+        """
+        Check if the default microphone source is muted using pactl.
+
+        Returns:
+            True if muted, False otherwise. Returns False if unable to detect.
+        """
+        now = time.time()
+        # Return cached value if still valid
+        if self._mute_cache is not None and (now - self._mute_cache_time) < self._mute_cache_ttl:
+            return self._mute_cache
+
+        try:
+            # Get default source mute status using pactl
+            result = subprocess.run(
+                ['pactl', 'get-source-mute', '@DEFAULT_SOURCE@'],
+                capture_output=True,
+                text=True,
+                timeout=1.0
+            )
+            if result.returncode == 0:
+                # Output is like "Mute: yes" or "Mute: no"
+                self._mute_cache = 'yes' in result.stdout.lower()
+            else:
+                self._mute_cache = False
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logger.debug(f"Could not check mute status: {e}")
+            self._mute_cache = False
+
+        self._mute_cache_time = now
+        return self._mute_cache
+
     def _audio_callback(self, indata, frames, time, status):
         """Callback for sounddevice stream."""
         if status:
@@ -933,6 +969,18 @@ class MicrophoneStream:
             return self._queue.get(timeout=0.1)
         except queue.Empty:
             return b''
+
+    def drain_queue(self):
+        """Drain all pending audio chunks from the queue."""
+        count = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+                count += 1
+            except queue.Empty:
+                break
+        if count > 0:
+            logger.debug(f"Drained {count} audio chunks from queue")
 
     @property
     def running(self) -> bool:
@@ -1059,7 +1107,23 @@ class WhisperTyperClient:
 
     async def _send_audio(self):
         """Send audio chunks to the server."""
+        was_muted = False
         while self._running and self.mic.running:
+            # Check if microphone is muted
+            if self.mic.is_muted():
+                if not was_muted:
+                    logger.info("Microphone muted, pausing audio stream")
+                    was_muted = True
+                    # Drain the audio queue to avoid sending stale audio
+                    self.mic.drain_queue()
+                await asyncio.sleep(0.1)  # Check less frequently when muted
+                continue
+            elif was_muted:
+                logger.info("Microphone unmuted, resuming audio stream")
+                was_muted = False
+                # Drain any audio that accumulated while muted
+                self.mic.drain_queue()
+
             chunk = self.mic.read_chunk()
             if chunk and self._websocket:
                 try:
