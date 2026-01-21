@@ -810,7 +810,11 @@ class MicrophoneStream:
         # Mute detection state
         self._mute_cache: Optional[bool] = None
         self._mute_cache_time: float = 0
-        self._mute_cache_ttl: float = 1.0  # Check mute status every second
+        self._mute_cache_ttl: float = 1.0  # Check software mute status every second
+        # Hardware mute detection (audio level based)
+        self._zero_audio_count: int = 0
+        self._zero_audio_threshold: int = 10  # Number of consecutive zero chunks to consider muted
+        self._hardware_muted: bool = False
 
     @classmethod
     def list_devices(cls) -> list[dict]:
@@ -878,14 +882,21 @@ class MicrophoneStream:
 
     def is_muted(self) -> bool:
         """
-        Check if the default microphone source is muted.
+        Check if the microphone is muted (hardware or software).
 
-        On Linux: uses pactl to check PulseAudio/PipeWire mute status
-        On macOS: uses osascript to check input volume (0 = muted)
+        Hardware mute: detected by checking if audio samples are all zeros
+        Software mute:
+          - Linux: uses pactl to check PulseAudio/PipeWire mute status
+          - macOS: uses osascript to check input volume (0 = muted)
 
         Returns:
             True if muted, False otherwise. Returns False if unable to detect.
         """
+        # Check hardware mute first (detected in audio callback)
+        if self._hardware_muted:
+            return True
+
+        # Check software mute (cached)
         now = time.time()
         # Return cached value if still valid
         if self._mute_cache is not None and (now - self._mute_cache_time) < self._mute_cache_ttl:
@@ -936,6 +947,20 @@ class MicrophoneStream:
         audio = indata.flatten().astype(np.float32)
         if self._device_sample_rate and self._device_sample_rate != self.target_sample_rate:
             audio = self._resample(audio, self._device_sample_rate, self.target_sample_rate)
+
+        # Detect hardware mute by checking if audio is all zeros
+        max_val = np.max(np.abs(audio))
+        if max_val < 1e-6:  # Essentially zero
+            self._zero_audio_count += 1
+            if self._zero_audio_count >= self._zero_audio_threshold and not self._hardware_muted:
+                self._hardware_muted = True
+                logger.debug("Hardware mute detected (audio is zeros)")
+        else:
+            if self._hardware_muted:
+                logger.debug("Hardware unmute detected (audio resumed)")
+            self._zero_audio_count = 0
+            self._hardware_muted = False
+
         self._queue.put(audio.tobytes())
 
     def start(self):
