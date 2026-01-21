@@ -878,7 +878,10 @@ class MicrophoneStream:
 
     def is_muted(self) -> bool:
         """
-        Check if the default microphone source is muted using pactl.
+        Check if the default microphone source is muted.
+
+        On Linux: uses pactl to check PulseAudio/PipeWire mute status
+        On macOS: uses osascript to check input volume (0 = muted)
 
         Returns:
             True if muted, False otherwise. Returns False if unable to detect.
@@ -889,18 +892,35 @@ class MicrophoneStream:
             return self._mute_cache
 
         try:
-            # Get default source mute status using pactl
-            result = subprocess.run(
-                ['pactl', 'get-source-mute', '@DEFAULT_SOURCE@'],
-                capture_output=True,
-                text=True,
-                timeout=1.0
-            )
-            if result.returncode == 0:
-                # Output is like "Mute: yes" or "Mute: no"
-                self._mute_cache = 'yes' in result.stdout.lower()
+            if sys.platform == 'darwin':
+                # macOS: check input volume (0 = muted)
+                result = subprocess.run(
+                    ['osascript', '-e', 'input volume of (get volume settings)'],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0
+                )
+                if result.returncode == 0:
+                    try:
+                        volume = int(result.stdout.strip())
+                        self._mute_cache = volume == 0
+                    except ValueError:
+                        self._mute_cache = False
+                else:
+                    self._mute_cache = False
             else:
-                self._mute_cache = False
+                # Linux: get default source mute status using pactl
+                result = subprocess.run(
+                    ['pactl', 'get-source-mute', '@DEFAULT_SOURCE@'],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0
+                )
+                if result.returncode == 0:
+                    # Output is like "Mute: yes" or "Mute: no"
+                    self._mute_cache = 'yes' in result.stdout.lower()
+                else:
+                    self._mute_cache = False
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
             logger.debug(f"Could not check mute status: {e}")
             self._mute_cache = False
