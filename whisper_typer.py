@@ -1134,6 +1134,8 @@ class WhisperTyperClient:
                 if not was_muted:
                     logger.info("Microphone muted, pausing audio stream")
                     was_muted = True
+                    # Update notification to show muted state
+                    self.notifier.show("🔇 Muted", persistent=True)
                     # Drain the audio queue to avoid sending stale audio
                     self.mic.drain_queue()
                 await asyncio.sleep(0.1)  # Check less frequently when muted
@@ -1141,6 +1143,8 @@ class WhisperTyperClient:
             elif was_muted:
                 logger.info("Microphone unmuted, resuming audio stream")
                 was_muted = False
+                # Update notification to show listening state
+                self.notifier.show("🎤 Listening...", persistent=True)
                 # Drain any audio that accumulated while muted
                 self.mic.drain_queue()
 
