@@ -810,7 +810,7 @@ class MicrophoneStream:
         # Mute detection state
         self._mute_cache: Optional[bool] = None
         self._mute_cache_time: float = 0
-        self._mute_cache_ttl: float = 0.5  # Check mute status every 500ms
+        self._mute_cache_ttl: float = 1.0  # Check mute status every second
 
     @classmethod
     def list_devices(cls) -> list[dict]:
