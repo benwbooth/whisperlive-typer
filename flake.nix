@@ -368,6 +368,7 @@ EOF
         with lib;
         let
           cfg = config.services.whisper-typer;
+          system = pkgs.stdenv.hostPlatform.system;
         in
         {
           options.services.whisper-typer = {
@@ -398,8 +399,8 @@ EOF
             programs.ydotool.enable = mkIf cfg.client.enable true;
 
             environment.systemPackages = mkMerge [
-              (mkIf cfg.client.enable [ self.packages.${pkgs.system}.whisper-typer ])
-              (mkIf cfg.server.enable [ self.packages.${pkgs.system}.whisperlive-server ])
+              (mkIf cfg.client.enable [ self.packages.${system}.whisper-typer ])
+              (mkIf cfg.server.enable [ self.packages.${system}.whisperlive-server ])
             ];
 
             systemd.services.whisperlive-server = mkIf cfg.server.enable {
@@ -414,7 +415,7 @@ EOF
 
               serviceConfig = {
                 Type = "simple";
-                ExecStart = "${self.packages.${pkgs.system}.whisperlive-server}/bin/whisperlive-server";
+                ExecStart = "${self.packages.${system}.whisperlive-server}/bin/whisperlive-server";
                 Restart = "on-failure";
                 # GPU access
                 SupplementaryGroups = [ "video" "render" ];
@@ -433,7 +434,7 @@ EOF
 
               serviceConfig = {
                 Type = "simple";
-                ExecStart = "${self.packages.${pkgs.system}.whisper-typer}/bin/whisper-typer";
+                ExecStart = "${self.packages.${system}.whisper-typer}/bin/whisper-typer";
                 Restart = "on-failure";
                 RestartSec = 3;
               };
