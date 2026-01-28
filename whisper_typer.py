@@ -412,8 +412,8 @@ class Config:
     no_speech_thresh: float = 0.45  # Segments with no_speech_prob above this are filtered (hallucinations)
     min_avg_logprob: float = -0.8  # Segments with avg_logprob below this are filtered (low confidence)
     pending_debounce_ms: int = 200  # Debounce pending updates to avoid excessive retyping
-    ydotool_key_delay_ms: int = 4  # Linux ydotool: delay between key presses (ms)
-    ydotool_key_hold_ms: int = 2   # Linux ydotool: key hold duration (ms)
+    ydotool_key_delay_ms: int = 8  # Linux ydotool: delay between key presses (ms)
+    ydotool_key_hold_ms: int = 4   # Linux ydotool: key hold duration (ms)
     # Server auto-start settings
     auto_start_server: bool = True  # Start server automatically if not running
     server_dir: str = ""  # Directory containing docker-compose.yml (empty = script directory)
