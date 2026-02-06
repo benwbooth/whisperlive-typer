@@ -641,6 +641,7 @@ class TyperState:
     finalized_length: int = 0  # Characters typed that are permanent
     pending_text: str = ""     # Current pending text (can change)
     last_command_text: str = ""  # Last command text we executed (to prevent re-execution)
+    last_command_at: float = 0.0  # Monotonic timestamp when last command was executed
 
 
 class StatefulTyper:
@@ -1064,6 +1065,8 @@ class WhisperTyperClient:
         self._debounce_timer: Optional[threading.Timer] = None
         self._debounced_pending: Optional[str] = None
         self._debounce_lock = threading.Lock()
+        # Suppress duplicate command messages from the same utterance (finalize + replay).
+        self._command_dedupe_window_s = 0.35
 
     async def connect(self):
         """Connect to the WhisperLive server."""
@@ -1082,6 +1085,7 @@ class WhisperTyperClient:
             "model": self.model,
             "use_vad": True,
             "no_speech_thresh": self.no_speech_thresh,
+            "min_avg_logprob": self.min_avg_logprob,
             "vad_parameters": {
                 "onset": self.vad_onset,
                 "offset": self.vad_offset,
@@ -1212,9 +1216,47 @@ class WhisperTyperClient:
         return text.lower().rstrip('.,!?')
 
     def _segment_passes_filters(self, segment: dict) -> bool:
-        no_speech_prob = float(segment.get("no_speech_prob", 0))
-        avg_logprob = float(segment.get("avg_logprob", 0))
+        try:
+            no_speech_prob = float(segment.get("no_speech_prob", 0))
+        except (TypeError, ValueError):
+            no_speech_prob = 0.0
+        try:
+            avg_logprob = float(segment.get("avg_logprob", 0))
+        except (TypeError, ValueError):
+            avg_logprob = 0.0
         return no_speech_prob <= self.no_speech_thresh and avg_logprob >= self.min_avg_logprob
+
+    @staticmethod
+    def _get_latest_segment(data: dict) -> Optional[dict]:
+        segments = data.get("segments")
+        if not isinstance(segments, list) or not segments:
+            return None
+        last = segments[-1]
+        return last if isinstance(last, dict) else None
+
+    @staticmethod
+    def _get_latest_completed_segment(data: dict) -> Optional[dict]:
+        segments = data.get("segments")
+        if not isinstance(segments, list):
+            return None
+        for segment in reversed(segments):
+            if isinstance(segment, dict) and segment.get("completed"):
+                return segment
+        return None
+
+    def _should_execute_command(self, command_text: str) -> bool:
+        normalized = self._normalize_cmd_text(command_text)
+        last_text = self.typer.state.last_command_text
+        now = time.monotonic()
+
+        if last_text:
+            last_normalized = self._normalize_cmd_text(last_text)
+            if normalized == last_normalized and (now - self.typer.state.last_command_at) < self._command_dedupe_window_s:
+                return False
+
+        self.typer.state.last_command_text = command_text
+        self.typer.state.last_command_at = now
+        return True
 
     def _handle_transcription(self, data: dict):
         """Process a transcription message from the server.
@@ -1232,19 +1274,20 @@ class WhisperTyperClient:
 
             finalized = data["finalize"]
 
+            # Extra client-side confidence guard for finalized text.
+            latest_completed = self._get_latest_completed_segment(data)
+            if latest_completed and not self._segment_passes_filters(latest_completed):
+                logger.info("Dropping low-confidence finalized segment")
+                finalized = ""
+
             # Check for commands in finalized text
             finalized_stripped = finalized.strip()
             if finalized_stripped:
                 cmd_result = self.commands.process(finalized_stripped)
                 if cmd_result.action in ("keys", "literal"):
-                    if (
-                        not self.typer.state.last_command_text
-                        or self._normalize_cmd_text(finalized_stripped)
-                        != self._normalize_cmd_text(self.typer.state.last_command_text)
-                    ):
+                    if self._should_execute_command(finalized_stripped):
                         self.typer.clear_pending()
                         self._execute_command(cmd_result)
-                        self.typer.state.last_command_text = finalized_stripped
                     return
 
             # Normal finalization
@@ -1254,20 +1297,18 @@ class WhisperTyperClient:
         if "text" in data:
             pending = data["text"]
 
-            # Check for commands in pending text
-            pending_stripped = pending.strip()
-            if pending_stripped:
-                cmd_result = self.commands.process(pending_stripped)
-                if cmd_result.action in ("keys", "literal"):
-                    if (
-                        not self.typer.state.last_command_text
-                        or self._normalize_cmd_text(pending_stripped)
-                        != self._normalize_cmd_text(self.typer.state.last_command_text)
-                    ):
-                        self.typer.clear_pending()
-                        self._execute_command(cmd_result)
-                        self.typer.state.last_command_text = pending_stripped
-                    return
+            # Only execute commands on finalized text to avoid triggering on unstable partials.
+            # For pending text, use confidence metadata (if present) to suppress likely hallucinations.
+            latest_segment = self._get_latest_segment(data)
+            if pending and latest_segment is not None:
+                segment_text = str(latest_segment.get("text", ""))
+                if segment_text.strip() == pending.strip() and not self._segment_passes_filters(latest_segment):
+                    logger.info(
+                        "Dropping low-confidence pending segment "
+                        f"(no_speech_prob={latest_segment.get('no_speech_prob')}, "
+                        f"avg_logprob={latest_segment.get('avg_logprob')})"
+                    )
+                    pending = ""
 
             # Normal pending update (debounced)
             self._schedule_pending_update(pending)
@@ -1400,6 +1441,18 @@ CLI arguments override config file settings.
         help="VAD offset threshold (0.0-1.0). Lower = longer speech segments."
     )
     parser.add_argument(
+        "--no-speech-thresh",
+        type=float,
+        default=None,
+        help="Drop segments with no_speech_prob above this threshold (0.0-1.0)."
+    )
+    parser.add_argument(
+        "--min-avg-logprob",
+        type=float,
+        default=None,
+        help="Drop segments with avg_logprob below this threshold."
+    )
+    parser.add_argument(
         "--no-auto-start",
         action="store_true",
         help="Don't auto-start the server if not running"
@@ -1443,6 +1496,10 @@ CLI arguments override config file settings.
         config.vad_onset = args.vad_onset
     if args.vad_offset is not None:
         config.vad_offset = args.vad_offset
+    if args.no_speech_thresh is not None:
+        config.no_speech_thresh = args.no_speech_thresh
+    if args.min_avg_logprob is not None:
+        config.min_avg_logprob = args.min_avg_logprob
     if args.no_auto_start:
         config.auto_start_server = False
     if args.server_dir is not None:

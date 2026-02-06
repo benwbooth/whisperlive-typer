@@ -82,6 +82,7 @@ class MLXTranscriptionServer(TranscriptionServer):
             client_uid=options.get("uid"),
             initial_prompt=options.get("initial_prompt"),
             no_speech_thresh=options.get("no_speech_thresh", 0.45),
+            min_avg_logprob=options.get("min_avg_logprob", -0.8),
             send_last_n_segments=options.get("send_last_n_segments", 10),
         )
         self.client_manager.add_client(websocket, client)

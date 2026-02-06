@@ -163,8 +163,21 @@ class YdotoolTyper(Typer):
         """Send backspace key presses."""
         if count <= 0:
             return
-        keys = ' '.join(['14:1', '14:0'] * count)
-        self._run_ydotool('key', f'--key-delay={self.key_delay}', *keys.split())
+        remaining = count
+        batch_size = 32
+        while remaining > 0:
+            batch = min(batch_size, remaining)
+            key_events = []
+            for _ in range(batch):
+                key_events.extend(['14:1', '14:0'])
+            self._run_ydotool(
+                'key',
+                f'--key-delay={self.key_delay}',
+                f'--key-hold={self.key_hold}',
+                '--clearmodifiers',
+                *key_events,
+            )
+            remaining -= batch
 
     def send_keys(self, keys_str: str):
         """Send key combination(s)."""
@@ -207,4 +220,10 @@ class YdotoolTyper(Typer):
         for code in reversed(codes):
             key_args.append(f"{code}:0")
 
-        self._run_ydotool('key', f'--key-delay={self.key_delay}', *key_args)
+        self._run_ydotool(
+            'key',
+            f'--key-delay={self.key_delay}',
+            f'--key-hold={self.key_hold}',
+            '--clearmodifiers',
+            *key_args,
+        )

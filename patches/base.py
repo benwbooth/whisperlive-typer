@@ -19,6 +19,8 @@ class ServeClientBase(object):
     """Number of most recent segments to send to the client."""
     no_speech_thresh: float
     """Segments with no speech probability above this threshold will be discarded."""
+    min_avg_logprob: float
+    """Segments with avg_logprob below this threshold will be discarded."""
     clip_audio: bool
     """Whether to clip audio with no valid segments."""
     same_output_threshold: int
@@ -33,11 +35,13 @@ class ServeClientBase(object):
         clip_audio=False,
         same_output_threshold=4,
         translation_queue=None,
+        min_avg_logprob=-0.8,
     ):
         self.client_uid = client_uid
         self.websocket = websocket
         self.send_last_n_segments = send_last_n_segments
         self.no_speech_thresh = no_speech_thresh
+        self.min_avg_logprob = min_avg_logprob
         self.clip_audio = clip_audio
         self.same_output_threshold = same_output_threshold
 
@@ -99,6 +103,13 @@ class ServeClientBase(object):
 
                 if result is None or self.language is None:
                     self.timestamp_offset += duration
+                    # If we had pending text and VAD now sees silence, explicitly clear it.
+                    if self.current_out:
+                        self.current_out = ""
+                        self.prev_out = ""
+                        self.same_output_count = 0
+                        self.end_time_for_same_output = None
+                        self.send_transcription_to_client(self.prepare_segments())
                     time.sleep(0.25)    # wait for voice activity, result is None when no voice activity
                     continue
                 self.handle_transcription_output(result, duration)
@@ -254,9 +265,8 @@ class ServeClientBase(object):
             msg["finalize"] = self.finalized_to_send
             self.finalized_to_send = None  # Clear after sending
 
-        # Include current pending text
-        if self.current_out:
-            msg["text"] = self.current_out
+        # Always include pending text, even when empty, so clients can clear stale pending.
+        msg["text"] = self.current_out
 
         # Keep segments for backward compatibility / debugging
         msg["segments"] = segments
@@ -297,11 +307,32 @@ class ServeClientBase(object):
     def get_segment_avg_logprob(self, segment):
         return getattr(segment, "avg_logprob", 0)
 
+    def segment_passes_filters(self, segment):
+        return (
+            self.get_segment_no_speech_prob(segment) <= self.no_speech_thresh
+            and self.get_segment_avg_logprob(segment) >= self.min_avg_logprob
+        )
+
     def get_segment_start(self, segment):
         return getattr(segment, "start", getattr(segment, "start_ts", 0))
 
     def get_segment_end(self, segment):
         return getattr(segment, "end", getattr(segment, "end_ts", 0))
+
+    @staticmethod
+    def join_finalized_texts(chunks):
+        merged = ""
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if (
+                merged
+                and merged[-1].isascii() and merged[-1].isalnum()
+                and chunk[0].isascii() and chunk[0].isalnum()
+            ):
+                merged += " "
+            merged += chunk
+        return merged
 
     def update_segments(self, segments, duration):
         """
@@ -323,13 +354,19 @@ class ServeClientBase(object):
         last_segment = None
         finalized_texts = []  # Collect all finalized texts to send
 
+        if not segments:
+            self.current_out = ""
+            self.prev_out = ""
+            self.same_output_count = 0
+            self.end_time_for_same_output = None
+            return None
+
         logging.info(f"update_segments: len={len(segments)}, duration={duration:.2f}, timestamp_offset={self.timestamp_offset:.2f}")
         for i, s in enumerate(segments):
             logging.info(f"  seg[{i}]: '{s.text}' start={self.get_segment_start(s):.2f} end={self.get_segment_end(s):.2f} no_speech={self.get_segment_no_speech_prob(s):.2f}")
 
-        # Process complete segments only if there are more than one
-        # and if the last segment's no_speech_prob is below the threshold.
-        if len(segments) > 1 and self.get_segment_no_speech_prob(segments[-1]) <= self.no_speech_thresh:
+        # Process completed segments independently from the last pending segment.
+        if len(segments) > 1:
             for s in segments[:-1]:
                 text_ = s.text
                 with self.lock:
@@ -337,7 +374,12 @@ class ServeClientBase(object):
                     end = self.timestamp_offset + min(duration, self.get_segment_end(s))
                 if start >= end:
                     continue
-                if self.get_segment_no_speech_prob(s) > self.no_speech_thresh:
+                if not self.segment_passes_filters(s):
+                    logging.debug(
+                        "  Dropping low-confidence completed segment: "
+                        f"no_speech={self.get_segment_no_speech_prob(s):.2f}, "
+                        f"avg_logprob={self.get_segment_avg_logprob(s):.2f}"
+                    )
                     continue
 
                 # Skip segments we've already processed (prevents duplicate finalization)
@@ -365,8 +407,8 @@ class ServeClientBase(object):
                 offset = min(duration, self.get_segment_end(s))
                 logging.info(f"  Completed segment: '{text_}' end={end:.2f}, offset={offset:.2f}")
 
-        # Process the last segment as pending if its no_speech_prob is acceptable.
-        if self.get_segment_no_speech_prob(segments[-1]) <= self.no_speech_thresh:
+        # Process the last segment as pending if confidence is acceptable.
+        if self.segment_passes_filters(segments[-1]):
             with self.lock:
                 pending_start = self.timestamp_offset + self.get_segment_start(segments[-1])
                 pending_end = self.timestamp_offset + min(duration, self.get_segment_end(segments[-1]))
@@ -381,9 +423,23 @@ class ServeClientBase(object):
                     avg_logprob=self.get_segment_avg_logprob(segments[-1]),
                 )
         else:
-            # High no_speech_prob - likely hallucination, clear pending
+            # Low-confidence pending segment - clear pending.
+            with self.lock:
+                pending_start = self.timestamp_offset + self.get_segment_start(segments[-1])
+                pending_end = self.timestamp_offset + min(duration, self.get_segment_end(segments[-1]))
+                last_segment = self.format_segment(
+                    pending_start, pending_end,
+                    "",
+                    completed=False,
+                    no_speech_prob=self.get_segment_no_speech_prob(segments[-1]),
+                    avg_logprob=self.get_segment_avg_logprob(segments[-1]),
+                )
             self.current_out = ""
-            logging.debug(f"  Clearing pending due to high no_speech_prob: {self.get_segment_no_speech_prob(segments[-1]):.2f}")
+            logging.debug(
+                "  Clearing pending due to low confidence: "
+                f"no_speech={self.get_segment_no_speech_prob(segments[-1]):.2f} "
+                f"avg_logprob={self.get_segment_avg_logprob(segments[-1]):.2f}"
+            )
 
         # Handle repeated output logic (stall detection)
         if self.current_out.strip() == self.prev_out.strip() and self.current_out != '':
@@ -398,10 +454,14 @@ class ServeClientBase(object):
         # If the same incomplete segment is repeated too many times, finalize it
         if self.same_output_count > self.same_output_threshold:
             last_no_speech = self.get_segment_no_speech_prob(segments[-1])
+            last_avg_logprob = self.get_segment_avg_logprob(segments[-1])
 
-            # Don't finalize if borderline no_speech_prob (likely hallucination)
-            if last_no_speech > 0.3:
-                logging.info(f"  Skipping repeated hallucination: '{self.current_out}' no_speech_prob={last_no_speech:.2f}")
+            # Don't finalize repeated low-confidence output (likely hallucination).
+            if not self.segment_passes_filters(segments[-1]):
+                logging.info(
+                    f"  Skipping repeated low-confidence segment: '{self.current_out}' "
+                    f"no_speech_prob={last_no_speech:.2f} avg_logprob={last_avg_logprob:.2f}"
+                )
                 offset = min(duration, self.end_time_for_same_output)
             elif not self.text or self.text[-1].strip().lower() != self.current_out.strip().lower():
                 # Finalize the repeated pending segment
@@ -453,7 +513,7 @@ class ServeClientBase(object):
 
         # Store finalized text for send_transcription_to_client to use
         if finalized_texts:
-            self.finalized_to_send = ''.join(finalized_texts)
+            self.finalized_to_send = self.join_finalized_texts(finalized_texts)
             logging.info(f"  Finalized text queued: '{self.finalized_to_send}'")
 
         return last_segment

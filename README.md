@@ -158,6 +158,13 @@ audio:
 vad:
   onset: 0.3   # speech detection threshold
   offset: 0.2  # speech end threshold
+  no_speech_thresh: 0.45
+  min_avg_logprob: -0.8
+
+typer:
+  pending_debounce_ms: 200
+  ydotool_key_delay_ms: 8
+  ydotool_key_hold_ms: 4
 
 commands:
   keys:
@@ -225,6 +232,10 @@ Options:
   -L, --list-devices    List available microphones
   --vad-onset FLOAT     VAD onset threshold (0.0-1.0)
   --vad-offset FLOAT    VAD offset threshold (0.0-1.0)
+  --no-speech-thresh FLOAT
+                        Filter threshold for no_speech_prob
+  --min-avg-logprob FLOAT
+                        Filter threshold for avg_logprob
   -n, --dry-run         Don't type, just log
   -v, --verbose         Debug logging
 ```
@@ -308,6 +319,8 @@ Or manually adjust `vad.onset` in config:
 
 If Whisper types random phrases ("Bye", "Thank you") during silence:
 - Increase `vad.onset` threshold
+- Decrease `vad.no_speech_thresh` (e.g. `0.45 -> 0.35`)
+- Increase `vad.min_avg_logprob` (e.g. `-0.8 -> -0.6`)
 - Use a directional microphone
 - Reduce background noise
 

@@ -22,6 +22,19 @@ vad:
   # Higher = less sensitive (may miss quiet speech)
   onset: 0.3
   offset: 0.2
+  # Filter pending/finalized segments with high "no speech" probability.
+  # Lower values reduce silence hallucinations but can drop quiet words.
+  no_speech_thresh: 0.45
+  # Filter low-confidence segments by average log probability.
+  # Higher values reduce hallucinations but can drop uncertain speech.
+  min_avg_logprob: -0.8
+
+typer:
+  # Debounce partial updates to reduce retyping churn.
+  pending_debounce_ms: 200
+  # Linux ydotool timing (increase if keys are dropped or reordered).
+  ydotool_key_delay_ms: 8
+  ydotool_key_hold_ms: 4
 
 # Voice commands - map phrases to actions
 #

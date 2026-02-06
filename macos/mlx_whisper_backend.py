@@ -42,6 +42,7 @@ class ServeClientMLXWhisper(ServeClientBase):
         initial_prompt=None,
         send_last_n_segments=10,
         no_speech_thresh=0.45,
+        min_avg_logprob=-0.8,
         clip_audio=False,
         same_output_threshold=10,
     ):
@@ -52,6 +53,7 @@ class ServeClientMLXWhisper(ServeClientBase):
             no_speech_thresh=no_speech_thresh,
             clip_audio=clip_audio,
             same_output_threshold=same_output_threshold,
+            min_avg_logprob=min_avg_logprob,
         )
 
         if not MLX_AVAILABLE:

@@ -265,6 +265,13 @@ vad:
   # Higher = less sensitive (may miss quiet speech)
   onset: 0.3
   offset: 0.2
+  no_speech_thresh: 0.45
+  min_avg_logprob: -0.8
+
+typer:
+  pending_debounce_ms: 200
+  ydotool_key_delay_ms: 8
+  ydotool_key_hold_ms: 4
 
 # Voice commands - map phrases to actions
 commands:
