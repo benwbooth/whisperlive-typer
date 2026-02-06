@@ -206,8 +206,8 @@ EOF
           src = pkgs.fetchFromGitHub {
             owner = "collabora";
             repo = "WhisperLive";
-            rev = "main";
-            hash = "sha256-ISSu25wlOqF/KvzRIU3hM9sd+0zmG6jRsId6xMzbue4=";
+            rev = "6c8142a9d2ca7accb0a686fd341191841427c43a";
+            hash = "sha256-Q9UDqoMQe+Y6N/E2IMlxBH0rgLOLCniJp6iS7iWc/CM=";
           };
 
           propagatedBuildInputs = with python.pkgs; [
