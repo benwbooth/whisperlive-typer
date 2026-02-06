@@ -219,6 +219,7 @@ EOF
             ffmpeg-python
             soundfile
             fastapi
+            uvicorn
           ];
 
           # Apply our patches
