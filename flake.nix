@@ -218,6 +218,7 @@ EOF
             torch  # Required for VAD (Voice Activity Detection)
             ffmpeg-python
             soundfile
+            fastapi
           ];
 
           # Apply our patches
