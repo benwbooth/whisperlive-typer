@@ -344,6 +344,9 @@ EOF
             rocm.rocminfo
           ];
 
+          # Keep flake inputs in closure so GC doesn't collect them
+          FLAKE_INPUTS = builtins.concatStringsSep ":" [ "${nixpkgs}" "${flake-utils}" ];
+
           LD_LIBRARY_PATH = "${pkgs.portaudio}/lib";
 
           shellHook = ''
