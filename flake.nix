@@ -322,11 +322,48 @@ EOF
           meta = whisper-typer-base.meta;
         };
 
+        # Rust frontend client
+        whisper-typer-rs-unwrapped = pkgs.rustPlatform.buildRustPackage {
+          pname = "whisper-typer-rs";
+          version = "0.1.0";
+
+          src = ./whisper-typer-rs;
+          cargoLock.lockFile = ./whisper-typer-rs/Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.alsa-lib ];
+
+          meta = with pkgs.lib; {
+            description = "Speech-to-text typing client using WhisperLive (Rust)";
+            homepage = "https://github.com/benwbooth/whisperlive-typer";
+            license = licenses.mit;
+            platforms = platforms.linux;
+            mainProgram = "whisper-typer";
+          };
+        };
+
+        whisper-typer-rs = pkgs.symlinkJoin {
+          name = "whisper-typer-rs";
+          paths = [ whisper-typer-rs-unwrapped whisper-toggle ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          postBuild = ''
+            wrapProgram $out/bin/whisper-typer \
+              --set YDOTOOL_SOCKET /run/ydotoold/socket \
+              --prefix PATH : ${pkgs.lib.makeBinPath [
+                pkgs.ydotool
+                pkgs.libnotify
+                pkgs.pulseaudio
+              ]}
+          '';
+          meta = whisper-typer-rs-unwrapped.meta;
+        };
+
       in
       {
         packages = {
           default = whisper-typer;
           inherit whisper-typer;
+          inherit whisper-typer-rs;
           inherit whisperlive-server;
           inherit ctranslate2-rocm;
           inherit faster-whisper;
@@ -342,6 +379,11 @@ EOF
             pkgs.libnotify
             python
             rocm.rocminfo
+            # Rust toolchain
+            pkgs.rustc
+            pkgs.cargo
+            pkgs.pkg-config
+            pkgs.alsa-lib
           ];
 
           # Keep flake inputs in closure so GC doesn't collect them
@@ -397,14 +439,24 @@ EOF
 
             client = {
               enable = mkEnableOption "WhisperLive client";
+
+              rust = mkOption {
+                type = types.bool;
+                default = false;
+                description = "Use the Rust client instead of the Python client";
+              };
             };
           };
 
-          config = mkIf cfg.enable {
+          config = mkIf cfg.enable (let
+            clientPkg = if cfg.client.rust
+              then self.packages.${system}.whisper-typer-rs
+              else self.packages.${system}.whisper-typer;
+          in {
             programs.ydotool.enable = mkIf cfg.client.enable true;
 
             environment.systemPackages = mkMerge [
-              (mkIf cfg.client.enable [ self.packages.${system}.whisper-typer ])
+              (mkIf cfg.client.enable [ clientPkg ])
               (mkIf cfg.server.enable [ self.packages.${system}.whisperlive-server ])
             ];
 
@@ -439,16 +491,17 @@ EOF
 
               serviceConfig = {
                 Type = "simple";
-                ExecStart = "${self.packages.${system}.whisper-typer}/bin/whisper-typer";
+                ExecStart = "${clientPkg}/bin/whisper-typer";
                 Restart = "on-failure";
                 RestartSec = 3;
               };
             };
-          };
+          });
         };
 
       overlays.default = final: prev: {
         whisper-typer = self.packages.${prev.system}.whisper-typer;
+        whisper-typer-rs = self.packages.${prev.system}.whisper-typer-rs;
         whisperlive-server = self.packages.${prev.system}.whisperlive-server;
       };
     };
