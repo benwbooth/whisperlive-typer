@@ -264,44 +264,6 @@ EOF
           '';
         };
 
-        # Frontend: whisper-typer client (base package)
-        whisper-typer-base = python.pkgs.buildPythonApplication {
-          pname = "whisper-typer";
-          version = "0.1.0";
-          format = "pyproject";
-
-          src = ./.;
-
-          nativeBuildInputs = with python.pkgs; [
-            setuptools
-          ];
-
-          propagatedBuildInputs = with python.pkgs; [
-            numpy
-            sounddevice
-            websockets
-            pyyaml
-            pyaudio
-            packaging
-            grapheme
-          ];
-
-          doCheck = false;
-
-          makeWrapperArgs = [
-            "--set" "YDOTOOL_SOCKET" "/run/ydotoold/socket"
-            "--prefix" "LD_LIBRARY_PATH" ":" "${pkgs.portaudio}/lib"
-          ];
-
-          meta = with pkgs.lib; {
-            description = "Speech-to-text typing client using WhisperLive and ydotool";
-            homepage = "https://github.com/benwbooth/whisperlive-typer";
-            license = licenses.mit;
-            platforms = platforms.linux;
-            mainProgram = "whisper-typer";
-          };
-        };
-
         # Toggle script for the client user service
         whisper-toggle = pkgs.writeShellScriptBin "whisper-toggle" ''
           SERVICE="whisper-typer.service"
@@ -315,16 +277,9 @@ EOF
           fi
         '';
 
-        # Combined package with client and toggle script
-        whisper-typer = pkgs.symlinkJoin {
-          name = "whisper-typer";
-          paths = [ whisper-typer-base whisper-toggle ];
-          meta = whisper-typer-base.meta;
-        };
-
         # Rust frontend client
-        whisper-typer-rs-unwrapped = pkgs.rustPlatform.buildRustPackage {
-          pname = "whisper-typer-rs";
+        whisper-typer-unwrapped = pkgs.rustPlatform.buildRustPackage {
+          pname = "whisper-typer";
           version = "0.1.0";
 
           src = ./whisper-typer-rs;
@@ -334,7 +289,7 @@ EOF
           buildInputs = [ pkgs.alsa-lib ];
 
           meta = with pkgs.lib; {
-            description = "Speech-to-text typing client using WhisperLive (Rust)";
+            description = "Speech-to-text typing client using WhisperLive";
             homepage = "https://github.com/benwbooth/whisperlive-typer";
             license = licenses.mit;
             platforms = platforms.linux;
@@ -342,9 +297,9 @@ EOF
           };
         };
 
-        whisper-typer-rs = pkgs.symlinkJoin {
-          name = "whisper-typer-rs";
-          paths = [ whisper-typer-rs-unwrapped whisper-toggle ];
+        whisper-typer = pkgs.symlinkJoin {
+          name = "whisper-typer";
+          paths = [ whisper-typer-unwrapped whisper-toggle ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/whisper-typer \
@@ -355,7 +310,7 @@ EOF
                 pkgs.pulseaudio
               ]}
           '';
-          meta = whisper-typer-rs-unwrapped.meta;
+          meta = whisper-typer-unwrapped.meta;
         };
 
       in
@@ -363,7 +318,6 @@ EOF
         packages = {
           default = whisper-typer;
           inherit whisper-typer;
-          inherit whisper-typer-rs;
           inherit whisperlive-server;
           inherit ctranslate2-rocm;
           inherit faster-whisper;
@@ -439,19 +393,11 @@ EOF
 
             client = {
               enable = mkEnableOption "WhisperLive client";
-
-              rust = mkOption {
-                type = types.bool;
-                default = false;
-                description = "Use the Rust client instead of the Python client";
-              };
             };
           };
 
           config = mkIf cfg.enable (let
-            clientPkg = if cfg.client.rust
-              then self.packages.${system}.whisper-typer-rs
-              else self.packages.${system}.whisper-typer;
+            clientPkg = self.packages.${system}.whisper-typer;
           in {
             programs.ydotool.enable = mkIf cfg.client.enable true;
 
