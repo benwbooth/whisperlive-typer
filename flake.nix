@@ -17,7 +17,7 @@
           };
         };
 
-        python = pkgs.python311;
+        python = pkgs.python313;
         rocm = pkgs.rocmPackages_6;
 
         # Target GPU architecture (RX 7900 XTX = gfx1100)
@@ -28,7 +28,7 @@
           name = "ctranslate2-rocm-source";
           url = "https://github.com/arlo-phoenix/CTranslate2-rocm.git";
           rev = "81c77087ec264299dbfe32a202c01f2b7e798a91";
-          hash = "sha256-bQDaBfpPLIjMV4FzTjwudk6ZktUG9+UnEgf+aqi/0zQ=";
+          hash = "sha256-Vb5LFpTcvngapAgLd63YrckUzC2whPw+hGMloJHv+2U=";
           fetchSubmodules = true;
           deepClone = true;
         };
