@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
@@ -126,6 +127,17 @@ impl AudioCapture {
         }
 
         let device_name = device.as_ref().map(|d| d.0.as_str());
+        // Low-latency buffer config. fragsize is the chunk pulse delivers per
+        // read; tying it to CHUNK_FRAMES keeps per-read latency at ~64ms
+        // instead of pulse's default of several hundred ms.
+        let chunk_bytes = (CHUNK_FRAMES * std::mem::size_of::<f32>()) as u32;
+        let attr = BufferAttr {
+            maxlength: chunk_bytes * 4,
+            tlength: u32::MAX,
+            prebuf: u32::MAX,
+            minreq: u32::MAX,
+            fragsize: chunk_bytes,
+        };
         let simple = Simple::new(
             None,                  // default server
             "whisper-typer",       // application name
@@ -134,7 +146,7 @@ impl AudioCapture {
             "Microphone",          // stream description
             &spec,
             None,                  // default channel map
-            None,                  // default buffering attrs
+            Some(&attr),
         )
         .with_context(|| format!("failed to open PulseAudio capture (device={:?})", device_name))?;
 
@@ -144,7 +156,10 @@ impl AudioCapture {
             TARGET_SAMPLE_RATE
         );
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        // Small backpressure window: 8 chunks × ~64ms ≈ 500ms total before
+        // a slow consumer starts losing audio. Keeps end-to-end latency
+        // bounded if the websocket/network stalls briefly.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
         let running = Arc::new(AtomicBool::new(true));
 
         let mut hw_mute = HardwareMuteDetector::new();

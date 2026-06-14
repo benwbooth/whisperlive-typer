@@ -190,8 +190,14 @@ pub struct LinuxNotifier {
 
 impl LinuxNotifier {
     pub fn new() -> Self {
+        // Restore the previously-saved notification id, so that across
+        // service restarts (e.g. whisper-toggle stop+start) we --replace-id
+        // the existing notification instead of stacking a new one each time.
+        let restored = std::fs::read_to_string(notification_id_path())
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
         Self {
-            notification_id: Mutex::new(None),
+            notification_id: Mutex::new(restored),
         }
     }
 }
