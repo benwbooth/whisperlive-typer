@@ -104,7 +104,7 @@ pub fn find_device(query: &str) -> Result<AudioDevice> {
 
 /// Running audio capture stream.
 pub struct AudioCapture {
-    pub rx: mpsc::Receiver<Vec<u8>>,
+    pub rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub hw_muted: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     _thread: std::thread::JoinHandle<()>,
@@ -156,10 +156,12 @@ impl AudioCapture {
             TARGET_SAMPLE_RATE
         );
 
-        // Small backpressure window: 8 chunks × ~64ms ≈ 500ms total before
-        // a slow consumer starts losing audio. Keeps end-to-end latency
-        // bounded if the websocket/network stalls briefly.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        // Unbounded: never drop audio. The Python client used queue.Queue()
+        // for the same reason — whisper-live's streaming algorithm assumes a
+        // continuous audio stream and gets stuck re-processing the same
+        // 7-second window when chunks are dropped. Mute / pause handle the
+        // bounded-buffer concern by draining the channel explicitly.
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let running = Arc::new(AtomicBool::new(true));
 
         let mut hw_mute = HardwareMuteDetector::new();
@@ -184,8 +186,10 @@ impl AudioCapture {
                         .fold(0.0f32, f32::max);
                     hw_mute.update(max_abs);
                     // Send a fresh Vec so the consumer owns its buffer.
-                    if tx.try_send(byte_buf.clone()).is_err() {
-                        // Receiver gone or backpressured; drop and continue.
+                    // unbounded_send only fails if the receiver is dropped,
+                    // which means we're shutting down — break the loop.
+                    if tx.send(byte_buf.clone()).is_err() {
+                        break;
                     }
                 }
             })
