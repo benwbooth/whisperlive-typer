@@ -14,8 +14,12 @@ tokio = { version = "1.49", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 futures-util = "0.3.32"
 
-# Audio capture
-cpal = "0.17"
+# Audio capture via PulseAudio's simple API. On PipeWire systems
+# pipewire-pulse handles the protocol transparently. Avoids the ALSA-plugin
+# ABI issues cpal hit with mixed nixpkgs revs (and the bindgen/glibc
+# compat issues miniaudio 0.10 has).
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.28"
 
 # WebSocket
 tokio-tungstenite = "0.28"

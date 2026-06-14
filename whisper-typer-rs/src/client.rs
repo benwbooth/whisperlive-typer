@@ -23,7 +23,7 @@ pub struct Client {
     typer: Arc<StatefulTyper>,
     notifier: Box<dyn Notifier>,
     commands: CommandProcessor,
-    device: Option<cpal::Device>,
+    device: Option<crate::audio::AudioDevice>,
 }
 
 impl Client {
@@ -31,7 +31,7 @@ impl Client {
         config: Config,
         typer: Arc<StatefulTyper>,
         notifier: Box<dyn Notifier>,
-        device: Option<cpal::Device>,
+        device: Option<crate::audio::AudioDevice>,
     ) -> Self {
         let commands = CommandProcessor::new(
             config.command_keys.clone(),

@@ -286,7 +286,10 @@ EOF
           cargoLock.lockFile = ./whisper-typer-rs/Cargo.lock;
 
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.alsa-lib ];
+          # libpulse-sys links libpulse + libpulse-simple at build time
+          # (pkg-config-driven). dlopen happens for the actual sound server
+          # backend (pipewire-pulse / pulseaudio) at runtime.
+          buildInputs = [ pkgs.libpulseaudio ];
 
           meta = with pkgs.lib; {
             description = "Speech-to-text typing client using WhisperLive";
@@ -307,7 +310,7 @@ EOF
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.ydotool
                 pkgs.libnotify
-                pkgs.pulseaudio
+                pkgs.pulseaudio  # provides pactl for --list-devices
               ]}
           '';
           meta = whisper-typer-unwrapped.meta;

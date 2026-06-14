@@ -1,16 +1,25 @@
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use anyhow::{Context as _, Result, bail};
+use libpulse_binding::sample::{Format, Spec};
+use libpulse_binding::stream::Direction;
+use libpulse_simple_binding::Simple;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::mute::HardwareMuteDetector;
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
-const CHUNK_SIZE: usize = 1024; // samples at target rate
+// Frames per read. At 16kHz mono f32, 1024 frames = ~64ms of audio per chunk.
+const CHUNK_FRAMES: usize = 1024;
+
+/// Opaque handle for a selected audio input device.
+/// PulseAudio uses string names; we just thread the user's config value
+/// through to `Simple::new` and let the daemon do the matching.
+#[derive(Clone, Debug)]
+pub struct AudioDevice(pub String);
 
 /// Info about an available audio input device.
 #[derive(Debug)]
@@ -21,133 +30,119 @@ pub struct AudioDeviceInfo {
 }
 
 /// List available audio input devices.
+///
+/// libpulse's async introspection API is overkill for this single use case
+/// (one-shot listing for `--list-devices`), so we shell out to `pactl`.
 pub fn list_devices() -> Result<Vec<AudioDeviceInfo>> {
-    let host = cpal::default_host();
+    let output = Command::new("pactl")
+        .args(["list", "short", "sources"])
+        .output()
+        .context("failed to run `pactl list short sources` (is PulseAudio/PipeWire running?)")?;
+    if !output.status.success() {
+        bail!(
+            "pactl list short sources failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut devices = Vec::new();
-    for (i, dev) in host.input_devices()?.enumerate() {
-        let name = dev.description().map(|d| d.to_string()).unwrap_or_else(|_| format!("Device {i}"));
-        let config = dev.default_input_config();
-        let sample_rate = config.map(|c| c.sample_rate()).unwrap_or(0);
-        devices.push(AudioDeviceInfo {
-            index: i,
-            name,
-            sample_rate,
-        });
+    for (i, line) in stdout.lines().enumerate() {
+        // Format: "<index>\t<name>\t<driver>\t<sample_spec>\t<state>"
+        // sample_spec example: "s16le 2ch 44100Hz"
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let name = parts[1].to_string();
+        let sample_rate = parts[3]
+            .split_whitespace()
+            .find_map(|tok| tok.strip_suffix("Hz").and_then(|s| s.parse::<u32>().ok()))
+            .unwrap_or(0);
+        devices.push(AudioDeviceInfo { index: i, name, sample_rate });
     }
     Ok(devices)
 }
 
-/// Find a device by index or name substring.
-pub fn find_device(query: &str) -> Result<Device> {
-    let host = cpal::default_host();
-    let devices: Vec<(usize, Device)> = host.input_devices()?.enumerate().collect();
+/// Resolve a user-supplied device query string to an AudioDevice.
+///
+/// PulseAudio accepts source names directly, so we only validate that
+/// SOMETHING with that name (or substring) exists, then pass the canonical
+/// name through. Numeric input is treated as an index into `list_devices`.
+pub fn find_device(query: &str) -> Result<AudioDevice> {
+    let devices = list_devices()?;
 
-    // Try as numeric index first
     if let Ok(index) = query.parse::<usize>() {
-        if let Some((_, dev)) = devices.into_iter().find(|(i, _)| *i == index) {
-            return Ok(dev);
-        }
-        bail!("No input device with index {index}");
+        let dev = devices
+            .into_iter()
+            .find(|d| d.index == index)
+            .with_context(|| format!("No input device with index {index}"))?;
+        return Ok(AudioDevice(dev.name));
     }
 
-    // Search by name substring
-    let query_lower = query.to_lowercase();
-    let mut matches: Vec<(usize, Device)> = devices
+    let q = query.to_lowercase();
+    let matches: Vec<AudioDeviceInfo> = devices
         .into_iter()
-        .filter(|(_, dev)| {
-            dev.description()
-                .map(|d| d.to_string())
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains(&query_lower)
-        })
+        .filter(|d| d.name.to_lowercase().contains(&q))
         .collect();
 
     match matches.len() {
         0 => bail!("No device found matching '{query}'"),
-        1 => Ok(matches.remove(0).1),
+        1 => Ok(AudioDevice(matches.into_iter().next().unwrap().name)),
         _ => {
-            let names: Vec<String> = matches
+            let listing: Vec<String> = matches
                 .iter()
-                .map(|(i, d)| format!("  [{i}] {}", d.description().map(|d| d.to_string()).unwrap_or_default()))
+                .map(|d| format!("  [{}] {}", d.index, d.name))
                 .collect();
             bail!(
                 "Multiple devices match '{query}':\n{}\nPlease be more specific or use the index number.",
-                names.join("\n")
+                listing.join("\n")
             );
         }
     }
 }
 
-/// Linear interpolation resampling.
-fn resample(audio: &[f32], orig_sr: u32, target_sr: u32) -> Vec<f32> {
-    if orig_sr == target_sr || audio.is_empty() {
-        return audio.to_vec();
-    }
-    let duration = audio.len() as f64 / orig_sr as f64;
-    let target_len = (duration * target_sr as f64) as usize;
-    if target_len == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(target_len);
-    let ratio = (audio.len() - 1) as f64 / (target_len - 1).max(1) as f64;
-    for i in 0..target_len {
-        let src = i as f64 * ratio;
-        let idx = src as usize;
-        let frac = src - idx as f64;
-        if idx + 1 < audio.len() {
-            out.push(audio[idx] * (1.0 - frac as f32) + audio[idx + 1] * frac as f32);
-        } else {
-            out.push(audio[audio.len() - 1]);
-        }
-    }
-    out
-}
-
 /// Running audio capture stream.
 pub struct AudioCapture {
-    _stream: Stream,
     pub rx: mpsc::Receiver<Vec<u8>>,
     pub hw_muted: Arc<AtomicBool>,
-    #[allow(dead_code)]
     running: Arc<AtomicBool>,
+    _thread: std::thread::JoinHandle<()>,
 }
 
 impl AudioCapture {
-    /// Start capturing audio from the given device (or default).
-    pub fn start(device: Option<Device>) -> Result<Self> {
-        let host = cpal::default_host();
-        let device = match device {
-            Some(d) => d,
-            None => host
-                .default_input_device()
-                .context("No default input device")?,
+    /// Open a PulseAudio capture stream and spawn a reader thread.
+    ///
+    /// PulseAudio handles resampling and channel downmix server-side when
+    /// we request mono f32 at TARGET_SAMPLE_RATE, regardless of the source's
+    /// native config.
+    pub fn start(device: Option<AudioDevice>) -> Result<Self> {
+        let spec = Spec {
+            format: Format::FLOAT32NE,
+            channels: 1,
+            rate: TARGET_SAMPLE_RATE,
         };
-
-        let dev_name = device.description().map(|d| d.to_string()).unwrap_or_else(|_| "unknown".into());
-        let supported = device.default_input_config()?;
-        let device_sr = supported.sample_rate();
-        let channels = supported.channels() as usize;
-
-        // Compute device-side block size to yield ~CHUNK_SIZE samples at target rate
-        let device_chunk = if device_sr != TARGET_SAMPLE_RATE {
-            (CHUNK_SIZE as f64 * device_sr as f64 / TARGET_SAMPLE_RATE as f64) as u32
-        } else {
-            CHUNK_SIZE as u32
-        };
-
-        info!(
-            "Audio device: {dev_name} ({device_sr} Hz, {channels}ch, chunk={device_chunk})"
-        );
-        if device_sr != TARGET_SAMPLE_RATE {
-            info!("Will resample {device_sr} Hz -> {TARGET_SAMPLE_RATE} Hz");
+        if !spec.is_valid() {
+            bail!("Invalid pulse sample spec: {:?}", spec);
         }
 
-        let config = StreamConfig {
-            channels: channels as u16,
-            sample_rate: device_sr,
-            buffer_size: cpal::BufferSize::Fixed(device_chunk),
-        };
+        let device_name = device.as_ref().map(|d| d.0.as_str());
+        let simple = Simple::new(
+            None,                  // default server
+            "whisper-typer",       // application name
+            Direction::Record,
+            device_name,
+            "Microphone",          // stream description
+            &spec,
+            None,                  // default channel map
+            None,                  // default buffering attrs
+        )
+        .with_context(|| format!("failed to open PulseAudio capture (device={:?})", device_name))?;
+
+        info!(
+            "Audio device: {} ({} Hz, mono, backend=pulse)",
+            device_name.unwrap_or("<default>"),
+            TARGET_SAMPLE_RATE
+        );
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
         let running = Arc::new(AtomicBool::new(true));
@@ -155,77 +150,38 @@ impl AudioCapture {
         let mut hw_mute = HardwareMuteDetector::new();
         let hw_muted = hw_mute.muted.clone();
 
-        // Shared callback logic: convert mono f32 audio → bytes and send
-        let process_mono = {
-            let tx = tx.clone();
-            let running = running.clone();
-            move |mono: Vec<f32>| {
-                if !running.load(Ordering::Relaxed) {
-                    return;
+        let running_thread = running.clone();
+        let thread = std::thread::Builder::new()
+            .name("audio-capture".into())
+            .spawn(move || {
+                // f32 samples; CHUNK_FRAMES * 4 bytes/sample.
+                let mut byte_buf = vec![0u8; CHUNK_FRAMES * std::mem::size_of::<f32>()];
+                while running_thread.load(Ordering::Relaxed) {
+                    if let Err(e) = simple.read(&mut byte_buf) {
+                        warn!("Audio read error: {e}");
+                        break;
+                    }
+                    // Compute the running max for the hardware-mute detector
+                    // without an extra allocation.
+                    let max_abs = byte_buf
+                        .chunks_exact(4)
+                        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]).abs())
+                        .fold(0.0f32, f32::max);
+                    hw_mute.update(max_abs);
+                    // Send a fresh Vec so the consumer owns its buffer.
+                    if tx.try_send(byte_buf.clone()).is_err() {
+                        // Receiver gone or backpressured; drop and continue.
+                    }
                 }
-                let max_abs = mono.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-                hw_mute.update(max_abs);
-                let resampled = resample(&mono, device_sr, TARGET_SAMPLE_RATE);
-                let bytes: Vec<u8> = resampled
-                    .iter()
-                    .flat_map(|&s| s.to_ne_bytes())
-                    .collect();
-                let _ = tx.try_send(bytes);
-            }
-        };
+            })
+            .context("failed to spawn audio capture thread")?;
 
-        let sample_format = supported.sample_format();
-        let stream = match sample_format {
-            SampleFormat::F32 => {
-                let mut process = process_mono;
-                device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        let mono = if channels > 1 {
-                            data.chunks(channels)
-                                .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-                                .collect()
-                        } else {
-                            data.to_vec()
-                        };
-                        process(mono);
-                    },
-                    move |err| warn!("Audio stream error: {err}"),
-                    None,
-                )?
-            }
-            SampleFormat::I16 => {
-                let mut process = process_mono;
-                device.build_input_stream(
-                    &config,
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let mono = if channels > 1 {
-                            data.chunks(channels)
-                                .map(|frame| {
-                                    frame.iter().map(|&s| s as f32 / 32768.0).sum::<f32>()
-                                        / channels as f32
-                                })
-                                .collect()
-                        } else {
-                            data.iter().map(|&s| s as f32 / 32768.0).collect()
-                        };
-                        process(mono);
-                    },
-                    move |err| warn!("Audio stream error: {err}"),
-                    None,
-                )?
-            }
-            other => bail!("Unsupported sample format: {other:?}"),
-        };
-
-        stream.play()?;
         info!("Audio capture started");
-
         Ok(Self {
-            _stream: stream,
             rx,
             hw_muted,
             running,
+            _thread: thread,
         })
     }
 
