@@ -176,13 +176,20 @@ impl Client {
             }
         });
 
-        // Wait for any task to complete
+        // Wait for any task to complete. Handle SIGTERM (systemctl stop)
+        // and SIGINT (Ctrl+C) gracefully so we get a chance to dismiss the
+        // notification on the way out.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
         tokio::select! {
             _ = send_task => info!("Send task ended"),
             _ = recv_task => info!("Receive task ended"),
             _ = handler_task => info!("Handler task ended"),
             _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received, stopping...");
+                info!("SIGINT received, stopping...");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, stopping...");
             }
         }
 
