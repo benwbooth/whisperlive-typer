@@ -311,6 +311,7 @@ EOF
                 pkgs.ydotool
                 pkgs.libnotify
                 pkgs.pulseaudio  # provides pactl for --list-devices
+                pkgs.glib        # provides gdbus for closing notifications
               ]}
           '';
           meta = whisper-typer-unwrapped.meta;
