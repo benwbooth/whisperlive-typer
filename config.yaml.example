@@ -8,6 +8,9 @@ server:
 whisper:
   language: en
   model: small  # tiny, base, small, medium, large
+  # Finalize an utterance after this many unchanged recognition passes.
+  # Lower is faster; raise to 3 if pauses split sentences too eagerly.
+  same_output_threshold: 2
 
 audio:
   # Microphone device - index number or name substring (e.g., "C930e" or "4")

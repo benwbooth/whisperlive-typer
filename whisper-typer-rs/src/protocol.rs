@@ -10,6 +10,7 @@ pub struct ClientConfig {
     pub use_vad: bool,
     pub no_speech_thresh: f64,
     pub min_avg_logprob: f64,
+    pub same_output_threshold: u32,
     pub vad_parameters: VadParameters,
 }
 

@@ -52,6 +52,8 @@ impl StatefulTyper {
 
     /// Handle finalized text from server — type it and mark as permanent.
     pub fn handle_finalize(&self, text: &str) {
+        let finalized = finalize_sentence(text);
+        let text = finalized.as_str();
         let mut state = self.state.lock().unwrap();
         let pending = &state.pending_text;
 
@@ -174,5 +176,95 @@ impl StatefulTyper {
             self.typer.backspace(grapheme_len(&state.pending_text));
             state.pending_text.clear();
         }
+    }
+}
+
+/// Normalize a completed dictation utterance to sentence punctuation.
+/// Whisper usually supplies punctuation, but short or low-context segments
+/// frequently arrive without it.
+fn finalize_sentence(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let last_content = trimmed
+        .chars()
+        .rev()
+        .find(|c| !matches!(c, '"' | '\'' | '\u{2019}' | '\u{201d}' | ')' | ']' | '}'));
+    if last_content.is_some_and(|c| {
+        matches!(c, '.' | '?' | '!' | '\u{2026}' | '\u{3002}' | '\u{ff1f}' | '\u{ff01}')
+    }) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::StatefulTyper;
+    use super::platform::Typer;
+
+    #[derive(Clone)]
+    struct RecordingTyper {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Typer for RecordingTyper {
+        fn type_text(&self, text: &str) {
+            self.events.lock().unwrap().push(format!("type:{text}"));
+        }
+
+        fn backspace(&self, count: usize) {
+            self.events.lock().unwrap().push(format!("backspace:{count}"));
+        }
+
+        fn send_keys(&self, keys_str: &str) {
+            self.events.lock().unwrap().push(format!("keys:{keys_str}"));
+        }
+    }
+
+    fn recording_typer() -> (StatefulTyper, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let typer = RecordingTyper {
+            events: events.clone(),
+        };
+        (StatefulTyper::new(Box::new(typer)), events)
+    }
+
+    #[test]
+    fn finalization_adds_period_and_space() {
+        let (typer, events) = recording_typer();
+        typer.update_pending(" Hello world");
+        typer.handle_finalize(" Hello world");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["type: Hello world", "type:.", "type: "]
+        );
+    }
+
+    #[test]
+    fn finalization_preserves_existing_sentence_punctuation() {
+        let (typer, events) = recording_typer();
+        typer.update_pending(" Are you ready?");
+        typer.handle_finalize(" Are you ready?");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["type: Are you ready?", "type: "]
+        );
+    }
+
+    #[test]
+    fn finalization_recognizes_punctuation_before_a_closing_quote() {
+        let (typer, events) = recording_typer();
+        typer.update_pending(" \"Ready?\"");
+        typer.handle_finalize(" \"Ready?\"");
+
+        assert_eq!(*events.lock().unwrap(), ["type: \"Ready?\"", "type: "]);
     }
 }

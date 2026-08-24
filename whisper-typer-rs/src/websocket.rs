@@ -33,6 +33,7 @@ pub async fn connect(config: &Config) -> Result<(WsSink, WsStream)> {
         use_vad: true,
         no_speech_thresh: config.no_speech_thresh,
         min_avg_logprob: config.min_avg_logprob,
+        same_output_threshold: config.same_output_threshold,
         vad_parameters: VadParameters {
             onset: config.vad_onset,
             offset: config.vad_offset,

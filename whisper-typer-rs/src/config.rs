@@ -33,6 +33,7 @@ struct ServerSection {
 struct WhisperSection {
     language: Option<String>,
     model: Option<String>,
+    same_output_threshold: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,6 +78,7 @@ pub struct Config {
     pub vad_offset: f64,
     pub no_speech_thresh: f64,
     pub min_avg_logprob: f64,
+    pub same_output_threshold: u32,
     pub pending_debounce_ms: u64,
     pub ydotool_key_delay_ms: u32,
     pub ydotool_key_hold_ms: u32,
@@ -100,6 +102,7 @@ impl Default for Config {
             vad_offset: 0.2,
             no_speech_thresh: 0.45,
             min_avg_logprob: -0.8,
+            same_output_threshold: 2,
             pending_debounce_ms: 200,
             ydotool_key_delay_ms: 8,
             ydotool_key_hold_ms: 4,
@@ -143,6 +146,7 @@ impl Config {
                         // Whisper
                         if let Some(v) = file.whisper.language { config.language = v; }
                         if let Some(v) = file.whisper.model { config.model = v; }
+                        if let Some(v) = file.whisper.same_output_threshold { config.same_output_threshold = v.max(1); }
                         // Audio
                         if let Some(v) = file.audio.device { config.device = v; }
                         // VAD
