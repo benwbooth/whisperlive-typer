@@ -252,7 +252,6 @@ server:
 whisper:
   language: en
   model: small
-  same_output_threshold: 2
 
 audio:
   # Microphone device - index number or name substring (e.g., "C930e" or "4")

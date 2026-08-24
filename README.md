@@ -7,7 +7,6 @@ Uses [WhisperLive](https://github.com/collabora/WhisperLive) server with AMD ROC
 
 - **Real-time typing**: Speaks → types at cursor position in any app
 - **Auto-correction**: Backspaces and fixes text as transcription updates
-- **Sentence finalization**: Adds sentence punctuation and a trailing space at utterance boundaries
 - **Voice commands**: "press enter", "scratch that", "new line", etc.
 - **Configurable**: YAML config for commands, VAD thresholds, server settings
 - **VAD calibration**: Tool to optimize voice detection for your environment
@@ -152,7 +151,6 @@ server:
 whisper:
   language: en
   model: small
-  same_output_threshold: 2  # lower = faster utterance finalization
 
 audio:
   device: ""  # or "C930e" or device index
@@ -238,8 +236,6 @@ Options:
                         Filter threshold for no_speech_prob
   --min-avg-logprob FLOAT
                         Filter threshold for avg_logprob
-  --same-output-threshold INT
-                        Finalize after this many unchanged recognition passes
   -n, --dry-run         Don't type, just log
   -v, --verbose         Debug logging
 ```

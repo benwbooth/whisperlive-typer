@@ -76,10 +76,6 @@ struct Cli {
     #[arg(long)]
     min_avg_logprob: Option<f64>,
 
-    /// Finalize after this many unchanged transcription passes
-    #[arg(long)]
-    same_output_threshold: Option<u32>,
-
     /// Don't auto-start the server if not running
     #[arg(long)]
     no_auto_start: bool,
@@ -127,7 +123,6 @@ fn main() -> Result<()> {
     if let Some(v) = cli.vad_offset { config.vad_offset = v; }
     if let Some(v) = cli.no_speech_thresh { config.no_speech_thresh = v; }
     if let Some(v) = cli.min_avg_logprob { config.min_avg_logprob = v; }
-    if let Some(v) = cli.same_output_threshold { config.same_output_threshold = v.max(1); }
     if cli.no_auto_start { config.auto_start_server = false; }
     if let Some(v) = cli.server_dir { config.server_dir = v; }
 
@@ -171,10 +166,6 @@ fn main() -> Result<()> {
     println!(
         "Filters: no_speech_thresh={}, min_avg_logprob={}",
         config.no_speech_thresh, config.min_avg_logprob
-    );
-    println!(
-        "Streaming: finalize after {} unchanged passes",
-        config.same_output_threshold
     );
     if let Some(ref q) = device_str {
         println!("Microphone: {q}");

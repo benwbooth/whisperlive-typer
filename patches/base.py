@@ -33,7 +33,7 @@ class ServeClientBase(object):
         send_last_n_segments=10,
         no_speech_thresh=0.35,
         clip_audio=False,
-        same_output_threshold=2,
+        same_output_threshold=4,
         translation_queue=None,
         min_avg_logprob=-0.8,
     ):
@@ -446,12 +446,13 @@ class ServeClientBase(object):
             self.same_output_count += 1
             if self.end_time_for_same_output is None:
                 self.end_time_for_same_output = self.get_segment_end(segments[-1])
+            time.sleep(0.1)
         else:
             self.same_output_count = 0
             self.end_time_for_same_output = None
 
         # If the same incomplete segment is repeated too many times, finalize it
-        if self.same_output_count >= self.same_output_threshold:
+        if self.same_output_count > self.same_output_threshold:
             last_no_speech = self.get_segment_no_speech_prob(segments[-1])
             last_avg_logprob = self.get_segment_avg_logprob(segments[-1])
 

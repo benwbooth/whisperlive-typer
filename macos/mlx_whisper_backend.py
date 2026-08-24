@@ -44,7 +44,7 @@ class ServeClientMLXWhisper(ServeClientBase):
         no_speech_thresh=0.45,
         min_avg_logprob=-0.8,
         clip_audio=False,
-        same_output_threshold=2,
+        same_output_threshold=10,
     ):
         super().__init__(
             client_uid=client_uid,

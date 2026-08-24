@@ -342,13 +342,12 @@ EOF
             pkgs.cargo
             pkgs.pkg-config
             pkgs.alsa-lib
-            pkgs.libpulseaudio
           ];
 
           # Keep flake inputs in closure so GC doesn't collect them
           FLAKE_INPUTS = builtins.concatStringsSep ":" [ "${nixpkgs}" "${flake-utils}" ];
 
-          LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [ pkgs.portaudio pkgs.libpulseaudio ]}";
+          LD_LIBRARY_PATH = "${pkgs.portaudio}/lib";
 
           shellHook = ''
             export YDOTOOL_SOCKET="/run/ydotoold/socket"
