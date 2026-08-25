@@ -252,6 +252,13 @@ port = int(os.environ.get("WHISPER_PORT", "9090"))
 backend = os.environ.get("WHISPER_BACKEND", "faster_whisper")
 model = os.environ.get("WHISPER_MODEL", None)
 
+if backend == "faster_whisper":
+    # Importing torch/CTranslate2 can take tens of seconds on a cold process.
+    # Pay that cost when the persistent system service starts, not when the
+    # user begins dictating.
+    print("Loading faster-whisper runtime...")
+    import whisper_live.backend.faster_whisper_backend
+
 print(f"Starting WhisperLive server on port {port} with backend {backend}")
 server = TranscriptionServer()
 server.run(

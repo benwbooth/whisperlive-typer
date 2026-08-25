@@ -30,7 +30,7 @@ vad:
   min_avg_logprob: -0.8
 
 typer:
-  # Debounce partial updates to reduce retyping churn.
+  # Type the first provisional result immediately, then rate-limit corrections.
   pending_debounce_ms: 200
   # Linux ydotool timing (increase if keys are dropped or reordered).
   ydotool_key_delay_ms: 8

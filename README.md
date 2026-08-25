@@ -162,7 +162,7 @@ vad:
   min_avg_logprob: -0.8
 
 typer:
-  pending_debounce_ms: 200
+  pending_debounce_ms: 200  # first result immediate; correction interval
   ydotool_key_delay_ms: 8
   ydotool_key_hold_ms: 4
 

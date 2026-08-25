@@ -269,6 +269,7 @@ vad:
   min_avg_logprob: -0.8
 
 typer:
+  # First provisional text is immediate; correction updates are rate-limited.
   pending_debounce_ms: 200
   ydotool_key_delay_ms: 8
   ydotool_key_hold_ms: 4

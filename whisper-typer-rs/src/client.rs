@@ -58,7 +58,9 @@ impl Client {
         let hw_muted = audio.hw_muted.clone();
         let sw_mute = Arc::new(SoftwareMuteDetector::new());
 
-        notifier.show("\u{1f3a4} Listening...", true);
+        // The WebSocket accepts connections before the per-client model has loaded.
+        // Do not claim to be listening until WhisperLive sends SERVER_READY.
+        notifier.show("Loading speech model...", true);
 
         // Channel for parsed server messages
         let (msg_tx, msg_rx) = mpsc::channel::<ServerMessage>(64);
@@ -155,7 +157,7 @@ impl Client {
             }
         });
 
-        // Handler: process messages with debounce
+        // Handler: process transcription and status messages
         let handler_task = tokio::spawn({
             let typer = self.typer;
             let commands = self.commands;
@@ -209,18 +211,22 @@ async fn handle_messages(
     config: &Config,
     cancel: CancellationToken,
 ) {
-    let debounce_ms = config.pending_debounce_ms;
+    let pending_update_interval = Duration::from_millis(config.pending_debounce_ms);
     let no_speech_thresh = config.no_speech_thresh;
     let min_avg_logprob = config.min_avg_logprob;
     let command_dedupe_window = Duration::from_millis(350);
+    let mut server_ready = false;
+    let mut muted = false;
 
-    // Debounce state
-    let mut debounced_pending: Option<String> = None;
-    let mut debounce_deadline: Option<tokio::time::Instant> = None;
+    // Apply the first provisional result immediately, then coalesce corrections
+    // to a fixed rate. A trailing-edge debounce can postpone feedback forever
+    // while the server is sending updates faster than the debounce interval.
+    let mut queued_pending: Option<String> = None;
+    let mut pending_deadline: Option<tokio::time::Instant> = None;
+    let mut last_pending_update: Option<tokio::time::Instant> = None;
 
     loop {
-        // If we have a debounced pending, use select with timeout
-        let sleep_fut = if let Some(deadline) = debounce_deadline {
+        let sleep_fut = if let Some(deadline) = pending_deadline {
             tokio::time::sleep_until(deadline)
         } else {
             // Sleep forever (will never complete)
@@ -230,35 +236,50 @@ async fn handle_messages(
         tokio::select! {
             _ = cancel.cancelled() => break,
 
-            // Debounce timer fired
-            _ = sleep_fut, if debounce_deadline.is_some() => {
-                if let Some(pending) = debounced_pending.take() {
-                    debounce_deadline = None;
+            // Apply the newest correction at the fixed update interval.
+            _ = sleep_fut, if pending_deadline.is_some() => {
+                if let Some(pending) = queued_pending.take() {
+                    pending_deadline = None;
                     tokio::task::block_in_place(|| {
                         typer.update_pending(&pending);
                     });
+                    last_pending_update = Some(tokio::time::Instant::now());
                 }
             }
 
             // Mute state change
-            Some(muted) = mute_rx.recv() => {
+            Some(is_muted) = mute_rx.recv() => {
+                muted = is_muted;
                 if muted {
                     notifier.show("\u{1f507} Muted", true);
-                } else {
+                } else if server_ready {
                     notifier.show("\u{1f3a4} Listening...", true);
+                } else {
+                    notifier.show("Loading speech model...", true);
                 }
             }
 
             // Server message
             Some(data) = msg_rx.recv() => {
+                if data.is_ready() {
+                    server_ready = true;
+                    info!(backend = ?data.backend, "Speech model ready");
+                    if muted {
+                        notifier.show("\u{1f507} Muted", true);
+                    } else {
+                        notifier.show("\u{1f3a4} Listening...", true);
+                    }
+                }
+
                 // Handle finalized text
                 if let Some(finalized) = &data.finalize {
-                    // Flush debounced pending first
-                    if let Some(pending) = debounced_pending.take() {
-                        debounce_deadline = None;
+                    // Flush the newest provisional text before finalizing it.
+                    if let Some(pending) = queued_pending.take() {
+                        pending_deadline = None;
                         tokio::task::block_in_place(|| {
                             typer.update_pending(&pending);
                         });
+                        last_pending_update = Some(tokio::time::Instant::now());
                     }
 
                     let mut finalized = finalized.clone();
@@ -322,16 +343,23 @@ async fn handle_messages(
                         }
                     }
 
-                    // Debounced pending update
-                    if debounce_ms == 0 {
+                    let now = tokio::time::Instant::now();
+                    let apply_now = pending_update_interval.is_zero()
+                        || last_pending_update
+                            .map(|last| now.duration_since(last) >= pending_update_interval)
+                            .unwrap_or(true);
+
+                    if apply_now {
+                        queued_pending = None;
+                        pending_deadline = None;
                         tokio::task::block_in_place(|| {
                             typer.update_pending(&pending);
                         });
+                        last_pending_update = Some(tokio::time::Instant::now());
                     } else {
-                        debounced_pending = Some(pending);
-                        debounce_deadline = Some(
-                            tokio::time::Instant::now() + Duration::from_millis(debounce_ms)
-                        );
+                        queued_pending = Some(pending);
+                        pending_deadline = last_pending_update
+                            .map(|last| last + pending_update_interval);
                     }
                 }
             }
@@ -401,5 +429,127 @@ fn execute_command(typer: &StatefulTyper, cmd: &CommandResult) {
         CommandAction::Keys => typer.send_keys(&cmd.payload),
         CommandAction::Literal => typer.type_text(&cmd.payload),
         CommandAction::None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use super::handle_messages;
+    use crate::commands::CommandProcessor;
+    use crate::config::Config;
+    use crate::protocol::ServerMessage;
+    use crate::typer::StatefulTyper;
+    use crate::typer::platform::{Notifier, Typer};
+
+    #[derive(Clone)]
+    struct RecordingTyper {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Typer for RecordingTyper {
+        fn type_text(&self, text: &str) {
+            self.events.lock().unwrap().push(format!("type:{text}"));
+        }
+
+        fn backspace(&self, count: usize) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("backspace:{count}"));
+        }
+
+        fn send_keys(&self, keys_str: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("keys:{keys_str}"));
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingNotifier {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Notifier for RecordingNotifier {
+        fn show(&self, message: &str, _persistent: bool) {
+            self.events.lock().unwrap().push(message.to_string());
+        }
+
+        fn close(&self) {}
+    }
+
+    fn message(text: Option<&str>, ready: bool) -> ServerMessage {
+        ServerMessage {
+            uid: None,
+            message: ready.then(|| serde_json::Value::String("SERVER_READY".into())),
+            backend: ready.then(|| "faster_whisper".into()),
+            finalize: None,
+            text: text.map(str::to_string),
+            segments: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn applies_first_pending_immediately_and_coalesces_corrections() {
+        let typing_events = Arc::new(Mutex::new(Vec::new()));
+        let notification_events = Arc::new(Mutex::new(Vec::new()));
+        let typer = StatefulTyper::new(Box::new(RecordingTyper {
+            events: typing_events.clone(),
+        }));
+        let notifier = RecordingNotifier {
+            events: notification_events.clone(),
+        };
+        let mut config = Config::default();
+        config.pending_debounce_ms = 100;
+        let commands = CommandProcessor::new(
+            config.command_keys.clone(),
+            config.command_literals.clone(),
+        );
+        let (message_tx, message_rx) = mpsc::channel(8);
+        let (_mute_tx, mut mute_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        let producer = async {
+            message_tx.send(message(None, true)).await.unwrap();
+            message_tx.send(message(Some("hello"), false)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(&*typing_events.lock().unwrap(), &["type:hello"]);
+            assert_eq!(
+                &*notification_events.lock().unwrap(),
+                &["\u{1f3a4} Listening..."]
+            );
+
+            message_tx.send(message(Some("help"), false)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(&*typing_events.lock().unwrap(), &["type:hello"]);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                &*typing_events.lock().unwrap(),
+                &["type:hello", "backspace:2", "type:p"]
+            );
+            cancel.cancel();
+        };
+
+        tokio::join!(
+            handle_messages(
+                message_rx,
+                &mut mute_rx,
+                &typer,
+                &commands,
+                &notifier,
+                &config,
+                cancel.clone(),
+            ),
+            producer
+        );
     }
 }

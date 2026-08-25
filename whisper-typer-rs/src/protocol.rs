@@ -27,9 +27,18 @@ pub struct VadParameters {
 pub struct ServerMessage {
     #[allow(dead_code)]
     pub uid: Option<serde_json::Value>,
+    pub message: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    pub backend: Option<String>,
     pub finalize: Option<String>,
     pub text: Option<String>,
     pub segments: Option<Vec<Segment>>,
+}
+
+impl ServerMessage {
+    pub fn is_ready(&self) -> bool {
+        self.message.as_ref().and_then(serde_json::Value::as_str) == Some("SERVER_READY")
+    }
 }
 
 /// A single transcription segment from the server.
@@ -52,5 +61,28 @@ impl Segment {
 
     pub fn avg_logprob_val(&self) -> f64 {
         self.avg_logprob.unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerMessage;
+
+    #[test]
+    fn recognizes_server_ready_message() {
+        let message: ServerMessage = serde_json::from_str(
+            r#"{"uid":123,"message":"SERVER_READY","backend":"faster_whisper"}"#,
+        )
+        .unwrap();
+
+        assert!(message.is_ready());
+    }
+
+    #[test]
+    fn accepts_non_string_server_messages() {
+        let message: ServerMessage =
+            serde_json::from_str(r#"{"uid":123,"status":"WAIT","message":1.5}"#).unwrap();
+
+        assert!(!message.is_ready());
     }
 }
