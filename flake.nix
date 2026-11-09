@@ -244,30 +244,7 @@ EOF
           text = ''
             export HSA_OVERRIDE_GFX_VERSION=11.0.0
             export HIP_VISIBLE_DEVICES=0
-            python << EOF
-import os
-from whisper_live.server import TranscriptionServer
-
-port = int(os.environ.get("WHISPER_PORT", "9090"))
-backend = os.environ.get("WHISPER_BACKEND", "faster_whisper")
-model = os.environ.get("WHISPER_MODEL", None)
-
-if backend == "faster_whisper":
-    # Importing torch/CTranslate2 can take tens of seconds on a cold process.
-    # Pay that cost when the persistent system service starts, not when the
-    # user begins dictating.
-    print("Loading faster-whisper runtime...")
-    import whisper_live.backend.faster_whisper_backend
-
-print(f"Starting WhisperLive server on port {port} with backend {backend}")
-server = TranscriptionServer()
-server.run(
-    "0.0.0.0",
-    port=port,
-    backend=backend,
-    faster_whisper_custom_model_path=model,
-)
-EOF
+            exec python -u ${./server/whisperlive_server.py}
           '';
         };
 
@@ -349,6 +326,7 @@ EOF
             pkgs.cargo
             pkgs.pkg-config
             pkgs.alsa-lib
+            pkgs.libpulseaudio  # linked by the Rust client (libpulse-simple)
           ];
 
           # Keep flake inputs in closure so GC doesn't collect them
@@ -395,6 +373,12 @@ EOF
                 description = "Port for the WhisperLive server";
               };
 
+              model = mkOption {
+                type = types.str;
+                default = "large-v3-turbo";
+                description = "Whisper model to preload at startup (should match the client's whisper.model)";
+              };
+
               gpuArch = mkOption {
                 type = types.str;
                 default = "gfx1100";
@@ -424,6 +408,7 @@ EOF
 
               environment = {
                 WHISPER_PORT = toString cfg.server.port;
+                WHISPER_PRELOAD_MODEL = cfg.server.model;
                 HSA_OVERRIDE_GFX_VERSION = "11.0.0";
               };
 

@@ -150,7 +150,7 @@ server:
 
 whisper:
   language: en
-  model: small
+  model: large-v3-turbo
 
 audio:
   device: ""  # or "C930e" or device index
@@ -163,6 +163,7 @@ vad:
 
 typer:
   pending_debounce_ms: 200  # first result immediate; correction interval
+  backend: portal           # portal (RemoteDesktop, default) or ydotool
   ydotool_key_delay_ms: 8
   ydotool_key_hold_ms: 4
 

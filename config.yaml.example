@@ -7,7 +7,7 @@ server:
 
 whisper:
   language: en
-  model: small  # tiny, base, small, medium, large
+  model: large-v3-turbo  # tiny, base, small, medium, large-v3, large-v3-turbo
 
 audio:
   # Microphone device - index number or name substring (e.g., "C930e" or "4")
@@ -32,6 +32,15 @@ vad:
 typer:
   # Type the first provisional result immediately, then rate-limit corrections.
   pending_debounce_ms: 200
+  # Linux key injection backend:
+  #   portal  - xdg-desktop-portal RemoteDesktop (default). Fast (~3000 chars/s),
+  #             types any Unicode, and can't drop keys when the compositor
+  #             stalls. Asks for permission once, then restores silently.
+  #   ydotool - uinput virtual keyboard. Used automatically if the portal
+  #             is unavailable.
+  backend: portal
+  # Optional pause between portal key events, in microseconds.
+  portal_key_delay_us: 0
   # Linux ydotool timing (increase if keys are dropped or reordered).
   ydotool_key_delay_ms: 8
   ydotool_key_hold_ms: 4

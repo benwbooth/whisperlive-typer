@@ -1,5 +1,7 @@
 pub mod platform;
 pub mod linux;
+#[cfg(target_os = "linux")]
+pub mod portal;
 pub mod macos;
 pub mod dry_run;
 

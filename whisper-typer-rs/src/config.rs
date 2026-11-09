@@ -56,6 +56,8 @@ struct TyperSection {
     pending_debounce_ms: Option<u64>,
     ydotool_key_delay_ms: Option<u32>,
     ydotool_key_hold_ms: Option<u32>,
+    backend: Option<String>,
+    portal_key_delay_us: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +82,10 @@ pub struct Config {
     pub pending_debounce_ms: u64,
     pub ydotool_key_delay_ms: u32,
     pub ydotool_key_hold_ms: u32,
+    /// Linux key injection: "portal" (RemoteDesktop portal, falls back to
+    /// ydotool if unavailable) or "ydotool".
+    pub typer_backend: String,
+    pub portal_key_delay_us: u64,
     pub auto_start_server: bool,
     pub server_dir: String,
     pub server_start_timeout: u64,
@@ -94,7 +100,7 @@ impl Default for Config {
             host: "localhost".into(),
             port: 9090,
             language: "en".into(),
-            model: "small".into(),
+            model: "large-v3-turbo".into(),
             device: String::new(),
             vad_onset: 0.3,
             vad_offset: 0.2,
@@ -103,6 +109,8 @@ impl Default for Config {
             pending_debounce_ms: 200,
             ydotool_key_delay_ms: 8,
             ydotool_key_hold_ms: 4,
+            typer_backend: "portal".into(),
+            portal_key_delay_us: 0,
             auto_start_server: true,
             server_dir: String::new(),
             server_start_timeout: 120,
@@ -154,6 +162,8 @@ impl Config {
                         if let Some(v) = file.typer.pending_debounce_ms { config.pending_debounce_ms = v; }
                         if let Some(v) = file.typer.ydotool_key_delay_ms { config.ydotool_key_delay_ms = v; }
                         if let Some(v) = file.typer.ydotool_key_hold_ms { config.ydotool_key_hold_ms = v; }
+                        if let Some(v) = file.typer.backend { config.typer_backend = v; }
+                        if let Some(v) = file.typer.portal_key_delay_us { config.portal_key_delay_us = v; }
                         // Commands (merge on top of defaults)
                         if let Some(cmds) = file.commands {
                             if let Some(keys) = cmds.keys {

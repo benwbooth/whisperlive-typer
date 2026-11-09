@@ -83,6 +83,15 @@ struct Cli {
     /// Directory containing docker-compose.yml for server auto-start
     #[arg(long)]
     server_dir: Option<String>,
+
+    /// Key injection backend (Linux): portal or ydotool
+    #[arg(long)]
+    typer: Option<String>,
+
+    /// Type this text with the configured backend after a short delay, then
+    /// exit (for testing key injection)
+    #[arg(long, value_name = "TEXT")]
+    type_test: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -125,6 +134,21 @@ fn main() -> Result<()> {
     if let Some(v) = cli.min_avg_logprob { config.min_avg_logprob = v; }
     if cli.no_auto_start { config.auto_start_server = false; }
     if let Some(v) = cli.server_dir { config.server_dir = v; }
+    if let Some(v) = cli.typer { config.typer_backend = v; }
+
+    if let Some(text) = cli.type_test {
+        let (typer, _) = build_platform_typer_notifier(cli.socket, &config);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        // A backspace character in the test text sends a Backspace keypress,
+        // so corrections can be exercised too.
+        for (i, chunk) in text.split('\u{8}').enumerate() {
+            if i > 0 { typer.backspace(1); }
+            typer.type_text(chunk);
+        }
+        eprintln!("typed {} chars in {:.0?}", text.chars().count(), start.elapsed());
+        return Ok(());
+    }
 
     // Resolve audio device
     let device_str = cli.device.or_else(|| {
@@ -207,13 +231,19 @@ fn build_platform_typer_notifier(
     socket: Option<String>,
     config: &Config,
 ) -> (Box<dyn typer::platform::Typer>, Box<dyn typer::platform::Notifier>) {
+    let notifier = typer::linux::LinuxNotifier::new();
+    if config.typer_backend == "portal" {
+        match typer::portal::PortalTyper::connect(config.portal_key_delay_us) {
+            Ok(typer) => return (Box::new(typer), Box::new(notifier)),
+            Err(e) => tracing::warn!("RemoteDesktop portal unavailable ({e:#}); falling back to ydotool"),
+        }
+    }
     let typer = typer::linux::YdotoolTyper::new(
         socket,
         false,
         config.ydotool_key_delay_ms,
         config.ydotool_key_hold_ms,
     );
-    let notifier = typer::linux::LinuxNotifier::new();
     (Box::new(typer), Box::new(notifier))
 }
 

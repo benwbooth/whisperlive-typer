@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use super::platform::{Notifier, Typer};
 
 /// Linux keyboard scan codes for ydotool (input-event-codes.h).
-fn key_codes() -> HashMap<&'static str, u16> {
+pub(crate) fn key_codes() -> HashMap<&'static str, u16> {
     HashMap::from([
         // Special keys
         ("escape", 1), ("esc", 1),
@@ -47,6 +47,23 @@ fn key_codes() -> HashMap<&'static str, u16> {
         ("grave", 41), ("backslash", 43),
         ("comma", 51), ("period", 52), ("dot", 52), ("slash", 53),
     ])
+}
+
+/// Parse a combo like "ctrl+shift+z" into evdev key codes. Returns None (and
+/// logs) if any part is unknown or the combo is empty.
+pub(crate) fn parse_combo(codes: &HashMap<&'static str, u16>, combo: &str) -> Option<Vec<u16>> {
+    let mut out = Vec::new();
+    for part in combo.split('+') {
+        let part = part.trim().trim_end_matches(|c: char| ".,!?".contains(c));
+        match codes.get(part) {
+            Some(&code) => out.push(code),
+            None => {
+                warn!("Unknown key: {part}");
+                return None;
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Keyboard input using ydotool (Linux/Wayland).
@@ -96,22 +113,9 @@ impl YdotoolTyper {
     fn send_key_combo(&self, combo: &str) {
         let combo = combo.to_lowercase();
         let combo = combo.trim_end_matches(|c| ".,!?".contains(c));
-        let parts: Vec<&str> = combo.split('+').collect();
-        let mut codes = Vec::new();
-
-        for part in &parts {
-            let part = part.trim().trim_end_matches(|c: char| ".,!?".contains(c));
-            if let Some(&code) = self.codes.get(part) {
-                codes.push(code);
-            } else {
-                warn!("Unknown key: {part}");
-                return;
-            }
-        }
-
-        if codes.is_empty() {
+        let Some(codes) = parse_combo(&self.codes, combo) else {
             return;
-        }
+        };
 
         info!("Sending keys: {combo}");
 

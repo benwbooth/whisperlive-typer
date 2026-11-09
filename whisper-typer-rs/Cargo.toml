@@ -42,6 +42,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 anyhow = "1"
 
+# Linux keyboard injection via the xdg-desktop-portal RemoteDesktop API
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.14.0", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+
 # macOS keyboard simulation
 [target.'cfg(target_os = "macos")'.dependencies]
 enigo = "0.6"
