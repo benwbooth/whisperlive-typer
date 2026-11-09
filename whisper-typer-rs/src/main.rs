@@ -1,4 +1,5 @@
 mod audio;
+mod chime;
 mod client;
 mod commands;
 mod config;
@@ -92,6 +93,14 @@ struct Cli {
     /// exit (for testing key injection)
     #[arg(long, value_name = "TEXT")]
     type_test: Option<String>,
+
+    /// Play the start ("on") or stop ("off") chime and exit
+    #[arg(long, value_name = "on|off")]
+    chime_test: Option<String>,
+
+    /// Don't play start/stop chimes
+    #[arg(long)]
+    no_chime: bool,
 }
 
 fn main() -> Result<()> {
@@ -135,6 +144,16 @@ fn main() -> Result<()> {
     if cli.no_auto_start { config.auto_start_server = false; }
     if let Some(v) = cli.server_dir { config.server_dir = v; }
     if let Some(v) = cli.typer { config.typer_backend = v; }
+    if cli.no_chime { config.chime_enabled = false; }
+
+    if let Some(which) = cli.chime_test {
+        let chime = match which.as_str() {
+            "on" => chime::Chime::On,
+            "off" => chime::Chime::Off,
+            other => anyhow::bail!("--chime-test expects on or off, got {other:?}"),
+        };
+        return chime::play_blocking(chime, config.chime_volume);
+    }
 
     if let Some(text) = cli.type_test {
         let (typer, _) = build_platform_typer_notifier(cli.socket, &config);

@@ -183,20 +183,32 @@ impl Client {
         // notification on the way out.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = send_task => info!("Send task ended"),
-            _ = recv_task => info!("Receive task ended"),
-            _ = handler_task => info!("Handler task ended"),
+        let stopped_by_user = tokio::select! {
+            _ = send_task => { info!("Send task ended"); false }
+            _ = recv_task => { info!("Receive task ended"); false }
+            _ = handler_task => { info!("Handler task ended"); false }
             _ = tokio::signal::ctrl_c() => {
                 info!("SIGINT received, stopping...");
+                true
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, stopping...");
+                true
             }
-        }
+        };
 
         cancel.cancel();
         notifier.close();
+        if stopped_by_user && self.config.chime_enabled {
+            let volume = self.config.chime_volume;
+            let played = tokio::task::spawn_blocking(move || {
+                crate::chime::play_blocking(crate::chime::Chime::Off, volume)
+            })
+            .await;
+            if let Ok(Err(e)) = played {
+                warn!("Could not play chime: {e}");
+            }
+        }
         info!("Client stopped");
         Ok(())
     }
@@ -262,6 +274,9 @@ async fn handle_messages(
             // Server message
             Some(data) = msg_rx.recv() => {
                 if data.is_ready() {
+                    if !server_ready && config.chime_enabled {
+                        crate::chime::play(crate::chime::Chime::On, config.chime_volume);
+                    }
                     server_ready = true;
                     info!(backend = ?data.backend, "Speech model ready");
                     if muted {

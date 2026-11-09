@@ -15,6 +15,7 @@ struct ConfigFile {
     audio: AudioSection,
     vad: VadSection,
     typer: TyperSection,
+    chime: ChimeSection,
     commands: Option<CommandsSection>,
 }
 
@@ -62,6 +63,13 @@ struct TyperSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct ChimeSection {
+    enabled: Option<bool>,
+    volume: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct CommandsSection {
     keys: Option<HashMap<String, String>>,
     literals: Option<HashMap<String, String>>,
@@ -86,6 +94,10 @@ pub struct Config {
     /// ydotool if unavailable) or "ydotool".
     pub typer_backend: String,
     pub portal_key_delay_us: u64,
+    /// Play a short chime when listening starts and stops.
+    pub chime_enabled: bool,
+    /// Chime loudness, 0.0-1.0.
+    pub chime_volume: f32,
     pub auto_start_server: bool,
     pub server_dir: String,
     pub server_start_timeout: u64,
@@ -111,6 +123,8 @@ impl Default for Config {
             ydotool_key_hold_ms: 4,
             typer_backend: "portal".into(),
             portal_key_delay_us: 0,
+            chime_enabled: true,
+            chime_volume: 0.3,
             auto_start_server: true,
             server_dir: String::new(),
             server_start_timeout: 120,
@@ -164,6 +178,9 @@ impl Config {
                         if let Some(v) = file.typer.ydotool_key_hold_ms { config.ydotool_key_hold_ms = v; }
                         if let Some(v) = file.typer.backend { config.typer_backend = v; }
                         if let Some(v) = file.typer.portal_key_delay_us { config.portal_key_delay_us = v; }
+                        // Chime
+                        if let Some(v) = file.chime.enabled { config.chime_enabled = v; }
+                        if let Some(v) = file.chime.volume { config.chime_volume = v; }
                         // Commands (merge on top of defaults)
                         if let Some(cmds) = file.commands {
                             if let Some(keys) = cmds.keys {

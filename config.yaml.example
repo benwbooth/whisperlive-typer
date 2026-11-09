@@ -29,6 +29,11 @@ vad:
   # Higher values reduce hallucinations but can drop uncertain speech.
   min_avg_logprob: -0.8
 
+chime:
+  # Three short high pips when listening starts, three pips a fifth lower when it stops.
+  enabled: true
+  volume: 0.3   # 0.0-1.0
+
 typer:
   # Type the first provisional result immediately, then rate-limit corrections.
   pending_debounce_ms: 200
