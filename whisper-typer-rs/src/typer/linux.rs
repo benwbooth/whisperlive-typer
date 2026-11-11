@@ -199,32 +199,28 @@ const NOTIFY_ICON: &str = "audio-input-microphone";
 
 /// Desktop notifications using notify-send (freedesktop).
 pub struct LinuxNotifier {
-    /// Current notification id and when its popup was first shown
-    /// (None when restored from a previous run: long settled).
-    state: Mutex<Option<(u32, Option<Instant>)>>,
+    /// Current notification id and when its popup was first shown.
+    state: Mutex<Option<(u32, Instant)>>,
 }
 
 impl LinuxNotifier {
     pub fn new() -> Self {
-        // Restore the previously-saved notification id, so that across
-        // service restarts (e.g. whisper-toggle stop+start) we --replace-id
-        // the existing notification instead of stacking a new one each time.
-        let restored = std::fs::read_to_string(notification_id_path())
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
+        // Always start with a fresh popup; never --replace-id an id saved by
+        // a previous run. Plasma recycles ids (its counter restarts with
+        // plasmashell and skips nothing that was replaced), so an old id may
+        // now be another app's live popup, and replacing it hijacks that
+        // popup: our text under its icon, stuck on screen.
         Self {
-            state: Mutex::new(restored.map(|id| (id, None))),
+            state: Mutex::new(None),
         }
     }
 }
 
 /// Block until a popup shown at `shown_at` has had time to settle.
-fn wait_for_settle(shown_at: Option<Instant>) {
-    if let Some(t) = shown_at {
-        let elapsed = t.elapsed();
-        if elapsed < POPUP_SETTLE {
-            std::thread::sleep(POPUP_SETTLE - elapsed);
-        }
+fn wait_for_settle(shown_at: Instant) {
+    let elapsed = shown_at.elapsed();
+    if elapsed < POPUP_SETTLE {
+        std::thread::sleep(POPUP_SETTLE - elapsed);
     }
 }
 
@@ -239,7 +235,7 @@ impl Notifier for LinuxNotifier {
         if persistent {
             cmd_args.push("--expire-time=0".to_string());
         }
-        let mut shown_at = Some(Instant::now());
+        let mut shown_at = Instant::now();
         if let Some((id, prev_shown_at)) = *state {
             wait_for_settle(prev_shown_at);
             cmd_args.push(format!("--replace-id={id}"));
@@ -256,7 +252,7 @@ impl Notifier for LinuxNotifier {
                 if let Ok(id) = stdout.trim().parse::<u32>() {
                     // A different id means a fresh popup was created.
                     if state.map(|(old, _)| old) != Some(id) {
-                        shown_at = Some(Instant::now());
+                        shown_at = Instant::now();
                     }
                     *state = Some((id, shown_at));
                     let id_path = notification_id_path();
