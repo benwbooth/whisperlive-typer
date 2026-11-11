@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -187,9 +188,20 @@ fn notification_id_path() -> PathBuf {
         .join("notification_id")
 }
 
+/// Plasma can lose track of a popup that is replaced or closed while it is
+/// still appearing: the original popup stays on screen with its first text
+/// and nothing can dismiss it. This is most likely when another app's popup
+/// (e.g. the RemoteDesktop portal's) arrives at the same moment. Never touch
+/// a popup until it has been on screen this long.
+const POPUP_SETTLE: Duration = Duration::from_millis(750);
+
+const NOTIFY_ICON: &str = "audio-input-microphone";
+
 /// Desktop notifications using notify-send (freedesktop).
 pub struct LinuxNotifier {
-    notification_id: Mutex<Option<u32>>,
+    /// Current notification id and when its popup was first shown
+    /// (None when restored from a previous run: long settled).
+    state: Mutex<Option<(u32, Option<Instant>)>>,
 }
 
 impl LinuxNotifier {
@@ -201,47 +213,75 @@ impl LinuxNotifier {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         Self {
-            notification_id: Mutex::new(restored),
+            state: Mutex::new(restored.map(|id| (id, None))),
+        }
+    }
+}
+
+/// Block until a popup shown at `shown_at` has had time to settle.
+fn wait_for_settle(shown_at: Option<Instant>) {
+    if let Some(t) = shown_at {
+        let elapsed = t.elapsed();
+        if elapsed < POPUP_SETTLE {
+            std::thread::sleep(POPUP_SETTLE - elapsed);
         }
     }
 }
 
 impl Notifier for LinuxNotifier {
     fn show(&self, message: &str, persistent: bool) {
+        let mut state = self.state.lock().unwrap();
         let mut cmd_args = vec![
-            "notify-send".to_string(),
             "--app-name=Whisper Typer".to_string(),
+            format!("--icon={NOTIFY_ICON}"),
             "--print-id".to_string(),
         ];
         if persistent {
             cmd_args.push("--expire-time=0".to_string());
         }
-        if let Some(id) = *self.notification_id.lock().unwrap() {
+        let mut shown_at = Some(Instant::now());
+        if let Some((id, prev_shown_at)) = *state {
+            wait_for_settle(prev_shown_at);
             cmd_args.push(format!("--replace-id={id}"));
+            // Replacing keeps the same popup; its settle time still counts.
+            shown_at = prev_shown_at;
         }
         cmd_args.push(message.to_string());
 
-        let result = Command::new(&cmd_args[0])
-            .args(&cmd_args[1..])
-            .output();
+        let result = Command::new("notify-send").args(&cmd_args).output();
 
-        match result {
-            Ok(output) if output.status.success() => {
+        if let Ok(output) = result {
+            if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Ok(id) = stdout.trim().parse::<u32>() {
-                    *self.notification_id.lock().unwrap() = Some(id);
+                    // A different id means a fresh popup was created.
+                    if state.map(|(old, _)| old) != Some(id) {
+                        shown_at = Some(Instant::now());
+                    }
+                    *state = Some((id, shown_at));
                     let id_path = notification_id_path();
                     let _ = std::fs::create_dir_all(id_path.parent().unwrap());
                     let _ = std::fs::write(&id_path, id.to_string());
                 }
             }
-            _ => {}
         }
     }
 
     fn close(&self) {
-        let mut id_guard = self.notification_id.lock().unwrap();
-        if let Some(id) = *id_guard {
+        let mut state = self.state.lock().unwrap();
+        if let Some((id, shown_at)) = *state {
+            wait_for_settle(shown_at);
+            // Belt and braces: replace with a near-instant expiry first, so
+            // the popup clears on its own even if the explicit close is lost.
+            let _ = Command::new("notify-send")
+                .args([
+                    "--app-name=Whisper Typer",
+                    &format!("--icon={NOTIFY_ICON}"),
+                    "--expire-time=1",
+                    &format!("--replace-id={id}"),
+                    "Stopped",
+                ])
+                .output();
             let _ = Command::new("gdbus")
                 .args([
                     "call", "--session",
@@ -251,7 +291,7 @@ impl Notifier for LinuxNotifier {
                     &id.to_string(),
                 ])
                 .output();
-            *id_guard = None;
+            *state = None;
         }
         let _ = std::fs::remove_file(notification_id_path());
     }
