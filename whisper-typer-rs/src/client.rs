@@ -58,9 +58,10 @@ impl Client {
         let hw_muted = audio.hw_muted.clone();
         let sw_mute = Arc::new(SoftwareMuteDetector::new());
 
-        // The WebSocket accepts connections before the per-client model has loaded.
-        // Do not claim to be listening until WhisperLive sends SERVER_READY.
-        notifier.show("Loading speech model...", true);
+        // The WebSocket accepts connections before the per-client model is
+        // ready, so "Listening" waits for SERVER_READY. The server keeps the
+        // model loaded, so that is usually instant; handle_messages only shows
+        // "Loading speech model..." if it takes a while.
 
         // Channel for parsed server messages
         let (msg_tx, msg_rx) = mpsc::channel::<ServerMessage>(64);
@@ -214,6 +215,9 @@ impl Client {
     }
 }
 
+/// How long SERVER_READY may take before the "Loading speech model..." popup.
+const LOADING_POPUP_DELAY: Duration = Duration::from_millis(500);
+
 async fn handle_messages(
     mut msg_rx: mpsc::Receiver<ServerMessage>,
     mute_rx: &mut mpsc::Receiver<bool>,
@@ -229,6 +233,10 @@ async fn handle_messages(
     let command_dedupe_window = Duration::from_millis(350);
     let mut server_ready = false;
     let mut muted = false;
+    // Show "Loading" only when SERVER_READY is slow (a real model load), not
+    // as a flash before "Listening" on every toggle.
+    let loading_deadline = tokio::time::Instant::now() + LOADING_POPUP_DELAY;
+    let mut loading_shown = false;
 
     // Apply the first provisional result immediately, then coalesce corrections
     // to a fixed rate. A trailing-edge debounce can postpone feedback forever
@@ -247,6 +255,13 @@ async fn handle_messages(
 
         tokio::select! {
             _ = cancel.cancelled() => break,
+
+            _ = tokio::time::sleep_until(loading_deadline),
+                if !loading_shown && !server_ready && !muted =>
+            {
+                loading_shown = true;
+                notifier.show("Loading speech model...", true);
+            }
 
             // Apply the newest correction at the fixed update interval.
             _ = sleep_fut, if pending_deadline.is_some() => {
