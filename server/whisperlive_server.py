@@ -46,10 +46,11 @@ if backend == "faster_whisper":
 
     preload = os.environ.get("WHISPER_PRELOAD_MODEL", "large-v3-turbo")
     if preload:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # torch is CPU-only; CTranslate2 is the ROCm build.
+        import ctranslate2
+        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
         if device == "cuda":
-            major, _ = torch.cuda.get_device_capability(device)
-            compute_type = "float16" if major >= 7 else "float32"
+            compute_type = "float16"
         else:
             compute_type = "int8"
         stub = ServeClientFasterWhisper.__new__(ServeClientFasterWhisper)

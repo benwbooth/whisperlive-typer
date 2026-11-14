@@ -11,14 +11,20 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          config = {
-            allowUnfree = true;
-            rocmSupport = true;
-          };
+          # No global rocmSupport: only CTranslate2 is built against ROCm
+          # (explicitly, below). With rocmSupport on, torch was also built
+          # against ROCm and brought up a second HIP runtime in the same
+          # process, even though WhisperLive only runs CPU work (Silero
+          # VAD) through it. Plain torch also comes from the binary cache.
+          config.allowUnfree = true;
         };
 
         python = pkgs.python313;
-        rocm = pkgs.rocmPackages_6;
+        # Track the default ROCm (7.x), the same release as the system's
+        # amdgpu/KFD stack and other ROCm users. ROCm 6.4 on a 7.x kernel
+        # was the backdrop for a MES REMOVE_QUEUE hang + GPU reset on
+        # 2026-11-14 that took the whole desktop down.
+        rocm = pkgs.rocmPackages;
 
         # Target GPU architecture (RX 7900 XTX = gfx1100)
         gpuArch = "gfx1100";
@@ -28,9 +34,10 @@
           name = "ctranslate2-rocm-source";
           url = "https://github.com/arlo-phoenix/CTranslate2-rocm.git";
           rev = "81c77087ec264299dbfe32a202c01f2b7e798a91";
-          hash = "sha256-Vb5LFpTcvngapAgLd63YrckUzC2whPw+hGMloJHv+2U=";
+          hash = "sha256-ALS6Bl/U4AY7j4IWLcKeUR8coXnxSNKn5z3yHjqwd1M=";
+          # No deepClone: it keeps .git, whose contents vary with the git
+          # version, so the hash broke on a nixpkgs bump.
           fetchSubmodules = true;
-          deepClone = true;
         };
 
         # Use ROCm's clang stdenv for proper HIP support
@@ -98,6 +105,15 @@
             sed -i 's/libmkl_sequential\.a/libmkl_sequential.so/g' CMakeLists.txt
             sed -i 's/libmkl_intel_thread\.a/libmkl_intel_thread.so/g' CMakeLists.txt
             sed -i 's/libmkl_gnu_thread\.a/libmkl_gnu_thread.so/g' CMakeLists.txt
+
+            # ROCm 7: hipBLAS's _v2 GEMM entry points (hipDataType +
+            # hipblasComputeType_t) became the plain names, and the _v2
+            # aliases were removed.
+            sed -i 's/hipblasGemmEx_v2/hipblasGemmEx/; s/hipblasGemmStridedBatchedEx_v2/hipblasGemmStridedBatchedEx/' src/cuda/primitives.cu
+
+            # ROCm 7's rocThrust no longer pulls these in transitively.
+            sed -i 's|#include <hip/hip_bf16.h>|&\n#include <thrust/iterator/counting_iterator.h>\n#include <thrust/reduce.h>\n#include <thrust/extrema.h>\n#include <thrust/execution_policy.h>|' src/cuda/helpers.h
+            grep -q 'thrust/iterator/counting_iterator.h' src/cuda/helpers.h
 
             # Fix missing cstdint include in cxxopts (needed for uint8_t)
             sed -i '1i #include <cstdint>' third_party/cxxopts/include/cxxopts.hpp
@@ -225,6 +241,15 @@ EOF
           # Apply our patches
           postPatch = ''
             cp ${./patches/base.py} whisper_live/backend/base.py
+
+            # torch is CPU-only here, so ask CTranslate2 (the ROCm build)
+            # whether a GPU exists. ROCm GPUs all support float16.
+            for f in whisper_live/backend/faster_whisper_backend.py whisper_live/server.py; do
+              substituteInPlace "$f" \
+                --replace-fail 'torch.cuda.is_available()' '__import__("ctranslate2").get_cuda_device_count() > 0'
+            done
+            substituteInPlace whisper_live/backend/faster_whisper_backend.py \
+              --replace-fail 'major, _ = torch.cuda.get_device_capability(device)' 'major = 7'
           '';
 
           doCheck = false;
