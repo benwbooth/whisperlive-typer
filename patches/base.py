@@ -5,6 +5,16 @@ import time
 import queue
 import numpy as np
 
+def normalize_text(text):
+    """Lowercase words only, for comparing passes regardless of punctuation."""
+    return " ".join("".join(c for c in w if c.isalnum()) for w in text.lower().split())
+
+
+# A pending segment counts as settled once Whisper has returned the same text
+# this many extra times in a row with at least this much audio after its end.
+SETTLED_REPEATS = 2
+SETTLED_SILENCE_S = 1.0
+
 
 class ServeClientBase(object):
     RATE = 16000
@@ -52,6 +62,8 @@ class ServeClientBase(object):
         self.text = []
         self.current_out = ""
         self.prev_out = ""
+        # Full text of the previous Whisper pass, for agreement checks.
+        self.prev_pass_text = ""
         self.exit = False
         self.same_output_count = 0
         self.transcript = []
@@ -366,9 +378,18 @@ class ServeClientBase(object):
             logging.info(f"  seg[{i}]: '{s.text}' start={self.get_segment_start(s):.2f} end={self.get_segment_end(s):.2f} no_speech={self.get_segment_no_speech_prob(s):.2f}")
 
         # Process completed segments independently from the last pending segment.
+        # Only commit a completed segment if the previous pass also produced
+        # its text. A single pass over a buffer ending in silence can flip to
+        # a hallucination ("Thank you. Thank you.") and mark it complete; it
+        # used to be committed at once, replacing the correct sentence.
+        prev_pass = normalize_text(self.prev_pass_text)
+        self.prev_pass_text = "".join(s.text for s in segments)
         if len(segments) > 1:
             for s in segments[:-1]:
                 text_ = s.text
+                if normalize_text(text_) not in prev_pass:
+                    logging.info(f"  Holding unconfirmed completed segment: '{text_}'")
+                    break
                 with self.lock:
                     start = self.timestamp_offset + self.get_segment_start(s)
                     end = self.timestamp_offset + min(duration, self.get_segment_end(s))
@@ -451,8 +472,18 @@ class ServeClientBase(object):
             self.same_output_count = 0
             self.end_time_for_same_output = None
 
-        # If the same incomplete segment is repeated too many times, finalize it
-        if self.same_output_count > self.same_output_threshold:
+        # Finalize the pending segment once it is stable. Counting repeats
+        # alone (threshold 10, ~3.5 s) let the buffer fill with silence, and
+        # Whisper fills long silence with hallucinations ("I don't know, I
+        # don't know...") that reset the count, so a finished sentence could
+        # sit uncommitted for 8+ seconds. If the text has stopped changing and
+        # the speaker has gone quiet after it, commit now.
+        trailing_silence = duration - self.get_segment_end(segments[-1])
+        settled = (
+            self.same_output_count >= SETTLED_REPEATS
+            and trailing_silence >= SETTLED_SILENCE_S
+        )
+        if self.same_output_count > self.same_output_threshold or settled:
             last_no_speech = self.get_segment_no_speech_prob(segments[-1])
             last_avg_logprob = self.get_segment_avg_logprob(segments[-1])
 

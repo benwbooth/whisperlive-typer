@@ -44,6 +44,42 @@ if backend == "faster_whisper":
 
     ServeClientFasterWhisper.create_model = _cached_create_model
 
+    # After a sentence is committed, the buffer often keeps a ~0.2 s sliver
+    # of VAD padding before the silence. Whisper turns that sliver into a
+    # whole invented sentence ("We'll be right back.", "Thank you."), which
+    # then settles and gets typed. Don't transcribe so little speech: wait
+    # for more audio, or drop the sliver once silence follows it.
+    MIN_SPEECH_S = 0.35
+    DROP_SLIVER_AFTER_S = 2.0
+
+    def _transcribe_audio(self, input_sample):
+        if ServeClientFasterWhisper.SINGLE_MODEL:
+            ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
+        try:
+            result, info = self.transcriber.transcribe(
+                input_sample,
+                initial_prompt=self.initial_prompt,
+                language=self.language,
+                task=self.task,
+                vad_filter=self.use_vad,
+                vad_parameters=self.vad_parameters if self.use_vad else None)
+            speech = getattr(info, "duration_after_vad", None)
+            if self.use_vad and speech is not None and 0 < speech < MIN_SPEECH_S:
+                duration = len(input_sample) / 16000
+                logging.info(f"  Ignoring {speech:.2f}s of speech in {duration:.2f}s buffer")
+                # None makes the caller skip past this buffer as silence;
+                # [] keeps it so a word that is just starting can grow.
+                return None if duration >= DROP_SLIVER_AFTER_S else []
+            result = list(result)
+        finally:
+            if ServeClientFasterWhisper.SINGLE_MODEL:
+                ServeClientFasterWhisper.SINGLE_MODEL_LOCK.release()
+        if self.language is None and info is not None:
+            self.set_language(info)
+        return result
+
+    ServeClientFasterWhisper.transcribe_audio = _transcribe_audio
+
     preload = os.environ.get("WHISPER_PRELOAD_MODEL", "large-v3-turbo")
     if preload:
         # torch is CPU-only; CTranslate2 is the ROCm build.
