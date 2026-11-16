@@ -443,6 +443,14 @@ EOF
                 Restart = "on-failure";
                 # GPU access
                 SupplementaryGroups = [ "video" "render" ];
+                # The GPU reads host buffers mapped straight from this
+                # process (KFD userptr). When the kernel swaps or reclaims
+                # those pages, amdgpu has to evict and restore the compute
+                # queues; on Navi 31 that path hung MES (full GPU reset,
+                # 2026-11-14 14:28) and faulted the server (20:53) while the
+                # host was deep in swap. Keep the server resident.
+                MemorySwapMax = 0;
+                MemoryMin = "4G";
               };
             };
 
