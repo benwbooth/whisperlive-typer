@@ -451,6 +451,24 @@ EOF
                 # host was deep in swap. Keep the server resident.
                 MemorySwapMax = 0;
                 MemoryMin = "4G";
+                # Dictation is interactive; background builds are not. Under
+                # system.slice the server got only an even split against
+                # user.slice, and with every devloop rebuilding after boot
+                # (load ~22) a 3 s chunk took 8 s to transcribe, so the typed
+                # text froze until the utterance finalized. A top-level slice
+                # with a high weight puts it ahead of user.slice.
+                Slice = "whisper.slice";
+                CPUWeight = 1000;
+                IOWeight = 1000;
+                Nice = -10;
+              };
+            };
+
+            systemd.slices.whisper = mkIf cfg.server.enable {
+              description = "Speech-to-text (interactive priority)";
+              sliceConfig = {
+                CPUWeight = 1000;
+                IOWeight = 1000;
               };
             };
 
@@ -469,6 +487,9 @@ EOF
                 ExecStart = "${clientPkg}/bin/whisper-typer";
                 Restart = "on-failure";
                 RestartSec = 3;
+                # Keep typing and its notifications ahead of devloop builds,
+                # which share app.slice with this service.
+                CPUWeight = 1000;
               };
             };
           });

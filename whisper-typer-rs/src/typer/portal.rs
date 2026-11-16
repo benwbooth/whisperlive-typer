@@ -70,7 +70,15 @@ fn keysym_for(c: char) -> i32 {
 impl PortalTyper {
     /// Start a RemoteDesktop session. Blocks until the session is running
     /// (which may include the user answering the permission dialog).
-    pub fn connect(key_delay_us: u64) -> Result<Self> {
+    ///
+    /// A restored session starts in ~20 ms. If it hasn't started after
+    /// `slow_after`, `on_slow` runs once (to tell the user why nothing is
+    /// happening: a permission dialog is up, or the portal is starved).
+    pub fn connect(
+        key_delay_us: u64,
+        slow_after: Duration,
+        on_slow: impl FnOnce(),
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<Job>();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<()>>(1);
 
@@ -92,7 +100,18 @@ impl PortalTyper {
             .context("spawn portal thread")?;
 
         // Generous timeout: the first run waits for the user to click Allow.
-        match ready_rx.recv_timeout(Duration::from_secs(120)) {
+        let first = match ready_rx.recv_timeout(slow_after) {
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                info!("RemoteDesktop portal is slow to start; waiting for it");
+                on_slow();
+                ready_rx.recv_timeout(Duration::from_secs(120))
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std_mpsc::RecvTimeoutError::Disconnected)
+            }
+            Ok(v) => Ok(v),
+        };
+        match first {
             Ok(Ok(())) => Ok(Self { tx, codes: key_codes() }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("timed out waiting for RemoteDesktop portal")),

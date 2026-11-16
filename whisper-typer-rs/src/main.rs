@@ -252,7 +252,18 @@ fn build_platform_typer_notifier(
 ) -> (Box<dyn typer::platform::Typer>, Box<dyn typer::platform::Notifier>) {
     let notifier = typer::linux::LinuxNotifier::new();
     if config.typer_backend == "portal" {
-        match typer::portal::PortalTyper::connect(config.portal_key_delay_us) {
+        // Nothing else is on screen until the session starts, so a stuck
+        // portal (permission dialog up, or the desktop starved for CPU) used
+        // to look like the toggle did nothing. Say what we're waiting for.
+        let connected = typer::portal::PortalTyper::connect(
+            config.portal_key_delay_us,
+            std::time::Duration::from_millis(500),
+            || {
+                use typer::platform::Notifier;
+                notifier.show("Waiting for keyboard access (Remote Control prompt)...", true);
+            },
+        );
+        match connected {
             Ok(typer) => return (Box::new(typer), Box::new(notifier)),
             Err(e) => tracing::warn!("RemoteDesktop portal unavailable ({e:#}); falling back to ydotool"),
         }
