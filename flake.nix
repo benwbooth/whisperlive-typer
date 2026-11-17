@@ -404,6 +404,23 @@ EOF
                 description = "Whisper model to preload at startup (should match the client's whisper.model)";
               };
 
+              device = mkOption {
+                type = types.enum [ "cpu" "auto" ];
+                default = "cpu";
+                description = ''
+                  Where Whisper runs. "cpu" keeps it off the GPU: on the
+                  7900 XTX that also drives the display, its ROCm work
+                  coincided with amdgpu shader errors and screen corruption.
+                  "auto" uses the GPU when CTranslate2 finds one.
+                '';
+              };
+
+              cpuThreads = mkOption {
+                type = types.int;
+                default = 8;
+                description = "CPU threads for Whisper when it runs on the CPU";
+              };
+
               gpuArch = mkOption {
                 type = types.str;
                 default = "gfx1100";
@@ -434,6 +451,8 @@ EOF
               environment = {
                 WHISPER_PORT = toString cfg.server.port;
                 WHISPER_PRELOAD_MODEL = cfg.server.model;
+                WHISPER_DEVICE = cfg.server.device;
+                WHISPER_CPU_THREADS = toString cfg.server.cpuThreads;
                 HSA_OVERRIDE_GFX_VERSION = "11.0.0";
               };
 

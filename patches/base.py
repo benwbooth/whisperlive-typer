@@ -13,6 +13,43 @@ def normalize_text(text):
     ).strip()
 
 
+FINALIZE_AFTER_SILENCE_S = 1.0
+COMMIT_COMPLETED_AFTER_S = 15.0
+
+
+def _common_words(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def choose_display(shown, prev_hyp, new):
+    """Pick the pending text to show for this pass.
+
+    Whisper re-decodes the same audio several times a second and often
+    alternates between two readings ("I've still seen ..." / "Still seeing
+    ..."). Showing every pass made the client erase and retype the line
+    several times a second, and the line never finalized because no two
+    passes matched. So: new words appended to what is shown appear at once;
+    rewriting words already shown needs the previous pass to agree with the
+    rewrite.
+    """
+    if not shown:
+        return new
+    s, n, p = (normalize_text(t).split() for t in (shown, new, prev_hyp))
+    if n == s:
+        return shown  # only case/punctuation changed
+    # Pure extension; the last shown word may have been cut off ("m-" -> "mail").
+    if len(n) >= len(s) and n[:len(s) - 1] == s[:-1] and (not s or n[len(s) - 1].startswith(s[-1])):
+        return new
+    if _common_words(p, n) > _common_words(s, n):
+        return new  # two passes in a row agree on the rewrite
+    return shown
+
+
 class ServeClientBase(object):
     RATE = 16000
     SERVER_READY = "SERVER_READY"
@@ -59,6 +96,7 @@ class ServeClientBase(object):
         self.text = []
         self.current_out = ""
         self.prev_out = ""
+        self.prev_hyp = ""
         self.last_pending_segment = None
         self.exit = False
         self.same_output_count = 0
@@ -376,7 +414,13 @@ class ServeClientBase(object):
             logging.info(f"  seg[{i}]: '{s.text}' start={self.get_segment_start(s):.2f} end={self.get_segment_end(s):.2f} no_speech={self.get_segment_no_speech_prob(s):.2f}")
 
         # Process completed segments independently from the last pending segment.
-        if len(segments) > 1:
+        # Whisper often splits one sentence into segments mid-way. Committing
+        # the first part at once made the rest get re-decoded without its
+        # context ("causes the screen" -> "call in the screen"). Keep the whole
+        # utterance pending until the speaker pauses; only commit completed
+        # segments early when the buffer is getting long.
+        commit_completed = duration >= COMMIT_COMPLETED_AFTER_S
+        if len(segments) > 1 and commit_completed:
             for s in segments[:-1]:
                 text_ = s.text
                 with self.lock:
@@ -421,17 +465,19 @@ class ServeClientBase(object):
         # Process the last segment as pending if confidence is acceptable.
         if self.segment_passes_filters(segments[-1]):
             with self.lock:
-                pending_start = self.timestamp_offset + self.get_segment_start(segments[-1])
+                pending_start = self.timestamp_offset + self.get_segment_start(segments[-1] if commit_completed else segments[0])
                 pending_end = self.timestamp_offset + min(duration, self.get_segment_end(segments[-1]))
 
-            self.current_out = segments[-1].text
-            # Whisper often flips case or a trailing period between passes
-            # over the same audio ("Enemies ..." / "enemies ...."). Each flip
-            # made the client delete and retype the whole line, and since no
-            # two passes matched, the line never finalized. Keep the text
-            # already shown when only case/punctuation changed.
-            if self.prev_out and normalize_text(self.current_out) == normalize_text(self.prev_out):
-                self.current_out = self.prev_out
+            hyp = segments[-1].text
+            if not commit_completed:
+                hyp = "".join(seg.text for seg in segments
+                              if self.segment_passes_filters(seg))
+            if finalized_texts:
+                # The old pending line was just committed; this is a new one.
+                self.current_out = hyp
+            else:
+                self.current_out = choose_display(self.prev_out, self.prev_hyp, hyp)
+            self.prev_hyp = hyp
             with self.lock:
                 last_segment = self.format_segment(
                     pending_start, pending_end,
@@ -477,8 +523,22 @@ class ServeClientBase(object):
             self.same_output_count = 0
             self.end_time_for_same_output = None
 
+        # Finalize once the speaker has stopped: about a second of silence
+        # after the last word. Re-decoding the same finished speech only
+        # rewrites it (and gives Whisper silence to invent text from).
+        trailing_silence = getattr(self, "trailing_silence_s", None)
+        if trailing_silence is None:
+            trailing_silence = duration - self.get_segment_end(segments[-1])
+        settled = (
+            self.current_out != ''
+            and not finalized_texts
+            and trailing_silence >= FINALIZE_AFTER_SILENCE_S
+        )
+        if settled and self.end_time_for_same_output is None:
+            self.end_time_for_same_output = self.get_segment_end(segments[-1])
+
         # If the same incomplete segment is repeated too many times, finalize it
-        if self.same_output_count > self.same_output_threshold:
+        if self.same_output_count > self.same_output_threshold or settled:
             last_no_speech = self.get_segment_no_speech_prob(segments[-1])
             last_avg_logprob = self.get_segment_avg_logprob(segments[-1])
 
@@ -518,6 +578,9 @@ class ServeClientBase(object):
             self.same_output_count = 0
             last_segment = None
             self.last_pending_segment = None
+            # The finalized line must not be held as "shown" for the next one.
+            self.prev_out = ""
+            self.prev_hyp = ""
             self.end_time_for_same_output = None
         else:
             self.prev_out = self.current_out

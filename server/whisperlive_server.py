@@ -1,6 +1,17 @@
 """WhisperLive server launcher: caches/preloads the faster-whisper model so
 client reconnects (e.g. toggling dictation) don't reload it."""
 import os
+
+# WHISPER_DEVICE=cpu keeps Whisper off the GPU entirely. On the 7900 XTX that
+# also drives the desktop, ROCm compute from this server coincided with amdgpu
+# shader errors (sq_intr) and corrupted squares on screen. Hide the GPU before
+# anything loads the HIP runtime.
+device_pref = os.environ.get("WHISPER_DEVICE", "auto")
+if device_pref == "cpu":
+    os.environ["HIP_VISIBLE_DEVICES"] = "-1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "8"))
+
 from whisper_live.server import TranscriptionServer
 
 port = int(os.environ.get("WHISPER_PORT", "9090"))
@@ -44,6 +55,18 @@ if backend == "faster_whisper":
 
     ServeClientFasterWhisper.create_model = _cached_create_model
 
+    # faster-whisper uses 4 CPU threads by default; with the model on the CPU
+    # each pass re-decodes several seconds of audio, so use more.
+    import whisper_live.backend.faster_whisper_backend as _fwb
+    _OrigWhisperModel = _fwb.WhisperModel
+
+    def _whisper_model(*args, **kwargs):
+        if kwargs.get("device", args[1] if len(args) > 1 else None) == "cpu":
+            kwargs.setdefault("cpu_threads", cpu_threads)
+        return _OrigWhisperModel(*args, **kwargs)
+
+    _fwb.WhisperModel = _whisper_model
+
     # After a sentence is committed, the buffer often keeps a ~0.2 s sliver
     # of VAD padding before the silence. Whisper turns that sliver into a
     # whole invented sentence ("We'll be right back.", "Thank you."), which
@@ -52,7 +75,30 @@ if backend == "faster_whisper":
     MIN_SPEECH_S = 0.35
     DROP_SLIVER_AFTER_S = 2.0
 
+    import dataclasses
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    def _measure_trailing_silence(self, input_sample):
+        """Seconds of silence at the end of the buffer, from Silero VAD.
+
+        Whisper's own segment end times often run into the pause after the
+        last word, so they can't tell when the speaker has stopped.
+        """
+        tail = input_sample[-3 * 16000:]
+        params = self.vad_parameters or {}
+        opts = params if isinstance(params, VadOptions) else VadOptions(**params)
+        opts = dataclasses.replace(opts, speech_pad_ms=0, min_silence_duration_ms=100)
+        speech = get_speech_timestamps(tail, opts)
+        if not speech:
+            return len(tail) / 16000
+        return (len(tail) - speech[-1]["end"]) / 16000
+
     def _transcribe_audio(self, input_sample):
+        try:
+            self.trailing_silence_s = _measure_trailing_silence(self, input_sample)
+        except Exception as e:
+            logging.warning(f"Trailing-silence VAD failed: {e}")
+            self.trailing_silence_s = None
         if ServeClientFasterWhisper.SINGLE_MODEL:
             ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
         try:
