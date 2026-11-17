@@ -6,6 +6,13 @@ import queue
 import numpy as np
 
 
+def normalize_text(text):
+    """Words only: lowercase, no punctuation, single spaces."""
+    return " ".join(
+        "".join(c for c in w if c.isalnum()) for w in text.lower().split()
+    ).strip()
+
+
 class ServeClientBase(object):
     RATE = 16000
     SERVER_READY = "SERVER_READY"
@@ -52,6 +59,7 @@ class ServeClientBase(object):
         self.text = []
         self.current_out = ""
         self.prev_out = ""
+        self.last_pending_segment = None
         self.exit = False
         self.same_output_count = 0
         self.transcript = []
@@ -107,6 +115,7 @@ class ServeClientBase(object):
                     if self.current_out:
                         self.current_out = ""
                         self.prev_out = ""
+                        self.last_pending_segment = None
                         self.same_output_count = 0
                         self.end_time_for_same_output = None
                         self.send_transcription_to_client(self.prepare_segments())
@@ -357,6 +366,7 @@ class ServeClientBase(object):
         if not segments:
             self.current_out = ""
             self.prev_out = ""
+            self.last_pending_segment = None
             self.same_output_count = 0
             self.end_time_for_same_output = None
             return None
@@ -390,6 +400,7 @@ class ServeClientBase(object):
                 # This segment is newly completed - add to finalized list
                 self.text.append(text_)
                 finalized_texts.append(text_)
+                self.last_pending_segment = None
 
                 completed_segment = self.format_segment(
                     start, end, text_, completed=True,
@@ -414,6 +425,13 @@ class ServeClientBase(object):
                 pending_end = self.timestamp_offset + min(duration, self.get_segment_end(segments[-1]))
 
             self.current_out = segments[-1].text
+            # Whisper often flips case or a trailing period between passes
+            # over the same audio ("Enemies ..." / "enemies ...."). Each flip
+            # made the client delete and retype the whole line, and since no
+            # two passes matched, the line never finalized. Keep the text
+            # already shown when only case/punctuation changed.
+            if self.prev_out and normalize_text(self.current_out) == normalize_text(self.prev_out):
+                self.current_out = self.prev_out
             with self.lock:
                 last_segment = self.format_segment(
                     pending_start, pending_end,
@@ -422,6 +440,14 @@ class ServeClientBase(object):
                     no_speech_prob=self.get_segment_no_speech_prob(segments[-1]),
                     avg_logprob=self.get_segment_avg_logprob(segments[-1]),
                 )
+            self.last_pending_segment = last_segment
+        elif not finalized_texts and self.last_pending_segment is not None:
+            # One low-confidence pass mid-sentence (e.g. " you" with
+            # no_speech 0.55) used to clear the line, so the client erased
+            # it and retyped it on the next pass. Keep showing what we had;
+            # the next confident pass replaces it.
+            self.current_out = self.prev_out
+            last_segment = dict(self.last_pending_segment)
         else:
             # Low-confidence pending segment - clear pending.
             with self.lock:
@@ -491,6 +517,7 @@ class ServeClientBase(object):
             self.current_out = ''
             self.same_output_count = 0
             last_segment = None
+            self.last_pending_segment = None
             self.end_time_for_same_output = None
         else:
             self.prev_out = self.current_out
