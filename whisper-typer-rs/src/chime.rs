@@ -14,6 +14,10 @@ const RATE: u32 = 48_000;
 // Very staccato: short pips with a fast decay and a longer gap.
 const BEEP_SECS: f32 = 0.030;
 const GAP_SECS: f32 = 0.055;
+/// Silence played before the beeps. PipeWire suspends idle outputs, and a
+/// Bluetooth headset takes a few hundred ms to resume; the 0.26 s chime was
+/// sometimes over (unheard) before the headset was listening.
+const LEAD_IN_SECS: f32 = 0.5;
 const HIGH_HZ: f32 = 879.0; // A5
 const LOW_HZ: f32 = HIGH_HZ / 1.5; // a perfect fifth below (D5)
 
@@ -38,7 +42,9 @@ fn synthesize(chime: Chime, volume: f32) -> Vec<f32> {
     let beep = (BEEP_SECS * RATE as f32) as usize;
     let gap = (GAP_SECS * RATE as f32) as usize;
     let attack = (0.002 * RATE as f32) as usize;
-    let mut out = Vec::with_capacity(3 * (beep + gap));
+    let lead_in = (LEAD_IN_SECS * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(lead_in + 3 * (beep + gap));
+    out.extend(std::iter::repeat_n(0.0, lead_in));
     for freq in chime.notes() {
         for i in 0..beep {
             let t = i as f32 / RATE as f32;
