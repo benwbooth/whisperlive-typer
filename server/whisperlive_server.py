@@ -70,7 +70,9 @@ if backend == "faster_whisper":
                 # None makes the caller skip past this buffer as silence;
                 # [] keeps it so a word that is just starting can grow.
                 return None if duration >= DROP_SLIVER_AFTER_S else []
-            result = list(result)
+            # faster-whisper returns None when VAD removed all the audio;
+            # the caller treats None as silence and moves past the buffer.
+            result = None if result is None else list(result)
         finally:
             if ServeClientFasterWhisper.SINGLE_MODEL:
                 ServeClientFasterWhisper.SINGLE_MODEL_LOCK.release()
