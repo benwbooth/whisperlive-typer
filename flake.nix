@@ -406,12 +406,14 @@ EOF
 
               device = mkOption {
                 type = types.enum [ "cpu" "auto" ];
-                default = "cpu";
+                default = "auto";
                 description = ''
-                  Where Whisper runs. "cpu" keeps it off the GPU: on the
-                  7900 XTX that also drives the display, its ROCm work
-                  coincided with amdgpu shader errors and screen corruption.
-                  "auto" uses the GPU when CTranslate2 finds one.
+                  Where Whisper runs. "auto" uses the GPU when CTranslate2
+                  finds one (~0.25 s per pass with small; fast enough to show
+                  each word as it is spoken). "cpu" keeps it off the GPU
+                  (~1.5-2 s per pass). amdgpu sq_intr shader errors and
+                  screen corruption were seen when extra ROCm processes
+                  (test servers) started or stopped beside the live one.
                 '';
               };
 
