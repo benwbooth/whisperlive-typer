@@ -400,7 +400,7 @@ EOF
 
               model = mkOption {
                 type = types.str;
-                default = "large-v3-turbo";
+                default = "small";
                 description = "Whisper model to preload at startup (should match the client's whisper.model)";
               };
 

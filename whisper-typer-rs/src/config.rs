@@ -112,7 +112,7 @@ impl Default for Config {
             host: "localhost".into(),
             port: 9090,
             language: "en".into(),
-            model: "large-v3-turbo".into(),
+            model: "small".into(),
             device: String::new(),
             vad_onset: 0.3,
             vad_offset: 0.2,

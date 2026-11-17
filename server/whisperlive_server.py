@@ -80,7 +80,7 @@ if backend == "faster_whisper":
 
     ServeClientFasterWhisper.transcribe_audio = _transcribe_audio
 
-    preload = os.environ.get("WHISPER_PRELOAD_MODEL", "large-v3-turbo")
+    preload = os.environ.get("WHISPER_PRELOAD_MODEL", "small")
     if preload:
         # torch is CPU-only; CTranslate2 is the ROCm build.
         import ctranslate2

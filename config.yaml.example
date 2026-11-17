@@ -7,7 +7,7 @@ server:
 
 whisper:
   language: en
-  model: large-v3-turbo  # tiny, base, small, medium, large-v3, large-v3-turbo
+  model: small  # tiny, base, small, medium, large-v3, large-v3-turbo
 
 audio:
   # Microphone device - index number or name substring (e.g., "C930e" or "4")

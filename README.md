@@ -150,7 +150,7 @@ server:
 
 whisper:
   language: en
-  model: large-v3-turbo
+  model: small
 
 audio:
   device: ""  # or "C930e" or device index
